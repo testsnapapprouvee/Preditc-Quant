@@ -415,6 +415,79 @@ class BacktestEngine:
         df = pd.DataFrame(results).set_index('date')
         return df, trades
 
+# ==========================================
+# PM SHADOW ENGINE (STEPS 0, 1, 2)
+# ==========================================
+class PMShadowEngine:
+    def __init__(self, data):
+        self.data = data.copy()
+        # On suppose que X2 est l'actif risqué (ex: LQQ) et X1 le hedge/safe (ex: Short ou Bonds)
+        self.risk_asset = self.data['X2']
+        self.safe_asset = self.data['X1']
+        
+    def generate_signals(self):
+        """STEP 1: Calcul des signaux bruts observés par le PM"""
+        df = pd.DataFrame(index=self.data.index)
+        
+        # 1. Momentum (Court et Moyen terme)
+        df['mom_1m'] = self.risk_asset.pct_change(21)
+        df['mom_3m'] = self.risk_asset.pct_change(63)
+        
+        # 2. Trend (Position vs Moyennes Mobiles)
+        df['ma_50'] = self.risk_asset.rolling(window=50).mean()
+        df['ma_200'] = self.risk_asset.rolling(window=200).mean()
+        # Distance au MA (normalisée)
+        df['trend_score'] = (self.risk_asset - df['ma_200']) / df['ma_200']
+        
+        # 3. Volatilité & Stress (Volatilité réalisée)
+        df['vol_20'] = self.risk_asset.pct_change().rolling(20).std() * np.sqrt(252)
+        
+        # 4. Convexité / Queue (Skewness sur 60 jours)
+        # Un skew négatif indique un risque de crash accru
+        df['skew_60'] = self.risk_asset.pct_change().rolling(60).skew()
+        
+        return df.dropna()
+
+    def calculate_conviction(self, signals_df):
+        """STEP 2: Transformer les signaux en Score de Conviction [-1, +1]"""
+        scores = pd.DataFrame(index=signals_df.index)
+        
+        # --- Logique de Conviction "PM" ---
+        
+        # A. Score de Tendance (Si prix > MA200 = Bullish)
+        # On utilise une fonction sigmoïde pour lisser entre -1 et 1
+        scores['trend_component'] = np.tanh(signals_df['trend_score'] * 10) 
+        
+        # B. Score de Momentum (Si positif = Bullish)
+        scores['mom_component'] = np.where(signals_df['mom_3m'] > 0, 1, -0.5)
+        
+        # C. Pénalité de Volatilité (Si Vol > 40% = Prudence extrême)
+        # 0 si vol basse, négatif si vol haute
+        scores['vol_penalty'] = np.where(signals_df['vol_20'] > 0.40, -0.5, 0)
+        
+        # D. Pénalité de Skew (Si Skew < -1 = Danger imminent)
+        scores['skew_penalty'] = np.where(signals_df['skew_60'] < -1.0, -0.3, 0)
+        
+        # --- Score Final ---
+        # Formule : (Trend * 0.5) + (Mom * 0.3) + Vol_Penalty + Skew_Penalty
+        raw_score = (scores['trend_component'] * 0.5) + \
+                    (scores['mom_component'] * 0.3) + \
+                    scores['vol_penalty'] + \
+                    scores['skew_penalty']
+                    
+        # On clip le score final entre -1 (Bearish max) et +1 (Bullish max)
+        scores['pm_conviction'] = raw_score.clip(-1, 1)
+        
+        # Définition de la "Posture" (Étiquette)
+        conditions = [
+            (scores['pm_conviction'] > 0.5),
+            (scores['pm_conviction'] < -0.3),
+        ]
+        choices = ['AGGRESSIVE', 'DEFENSIVE']
+        scores['pm_posture'] = np.select(conditions, choices, default='NEUTRAL')
+        
+        return scores
+
 def create_optimization_objective(backtest_func, calculate_metrics_func, 
                                  data, profile='BALANCED', confirm=2):
     """Create objective function for optimization"""
@@ -877,7 +950,8 @@ met_strat = calculate_metrics_legacy(df_res['strategy'])
 met_x2 = calculate_metrics_legacy(df_res['bench_x2'])
 met_x1 = calculate_metrics_legacy(df_res['bench_x1'])
 
-tabs = st.tabs(["Performance", "Risk Analytics", "Allocation", "Trades"])
+# --- MODIFIED: Added "👥 PM Shadow" to tabs list ---
+tabs = st.tabs(["Performance", "Risk Analytics", "Allocation", "Trades", "👥 PM Shadow"])
 
 # TAB 1: Performance
 with tabs[0]:
@@ -1050,6 +1124,45 @@ with tabs[3]:
         st.dataframe(trades_display, use_container_width=True, hide_index=True)
     else:
         st.info("ℹ️ No regime transitions occurred (stayed in R0 - Offensive)")
+
+# --- TAB 5: PM SHADOW (ADDED) ---
+with tabs[4]:
+    st.markdown("#### 👥 PM Shadow Overlay")
+    st.info("Ce module simule le comportement d'un Portfolio Manager (PM) quantitatif observant les mêmes données.")
+
+    # Instanciation et Calculs (Live)
+    if not data.empty:
+        pm_engine = PMShadowEngine(data)
+        
+        # Step 1: Signaux
+        pm_signals = pm_engine.generate_signals()
+        
+        # Step 2: Conviction
+        pm_scores = pm_engine.calculate_conviction(pm_signals)
+        
+        # Visualisation de la Conviction (Step 2 Check)
+        latest_score = pm_scores['pm_conviction'].iloc[-1]
+        latest_posture = pm_scores['pm_posture'].iloc[-1]
+        
+        col_pm1, col_pm2, col_pm3 = st.columns(3)
+        col_pm1.metric("PM Conviction Score", f"{latest_score:.2f}", help="Score entre -1 (Bearish) et +1 (Bullish)")
+        
+        color_map = {'AGGRESSIVE': 'normal', 'NEUTRAL': 'off', 'DEFENSIVE': 'inverse'}
+        col_pm2.metric("PM Posture", latest_posture, delta_color=color_map.get(latest_posture, 'off'))
+        
+        col_pm3.metric("Market Skew (Risk)", f"{pm_signals['skew_60'].iloc[-1]:.2f}")
+        
+        st.markdown("---")
+        st.markdown("#### Évolution de la Conviction PM")
+        
+        # Graphique Area Chart du score de conviction
+        st.area_chart(pm_scores['pm_conviction'], height=250, color="#3B82F6")
+        
+        with st.expander("🔎 Voir les signaux bruts du PM"):
+            st.dataframe(pm_signals.tail(10), use_container_width=True)
+            
+    else:
+        st.warning("En attente des données pour calculer le Shadow PM...")
 
 st.markdown("---")
 st.markdown("""

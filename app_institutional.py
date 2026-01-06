@@ -150,30 +150,76 @@ class MultiObjectiveScorer:
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_data_legacy(tickers, start, end):
-    """Fetch market data with retry logic"""
+    """Fetch market data with enhanced retry logic and better error handling"""
     if len(tickers) < 2:
+        st.error("❌ Need at least 2 tickers")
         return pd.DataFrame()
+    
+    # Convert datetime to string format for yfinance
+    if isinstance(start, datetime):
+        start_str = start.strftime('%Y-%m-%d')
+    else:
+        start_str = str(start)
+    
+    if isinstance(end, datetime):
+        end_str = end.strftime('%Y-%m-%d')
+    else:
+        end_str = str(end)
     
     for attempt in range(3):
         try:
             data_list = []
+            ticker_names = []
+            
             for ticker in tickers[:2]:
                 try:
-                    df = yf.download(ticker, start=start, end=end, progress=False)
-                    if not df.empty and 'Adj Close' in df.columns:
-                        data_list.append(df['Adj Close'])
-                except:
+                    # Download with explicit parameters
+                    df = yf.download(
+                        ticker, 
+                        start=start_str, 
+                        end=end_str, 
+                        progress=False,
+                        auto_adjust=True,
+                        actions=False
+                    )
+                    
+                    # Handle both single and multi-level column structure
+                    if not df.empty:
+                        if 'Close' in df.columns:
+                            data_list.append(df['Close'])
+                            ticker_names.append(ticker)
+                        elif 'Adj Close' in df.columns:
+                            data_list.append(df['Adj Close'])
+                            ticker_names.append(ticker)
+                        else:
+                            # Multi-index columns
+                            if len(df.columns) > 0:
+                                data_list.append(df.iloc[:, 0])
+                                ticker_names.append(ticker)
+                
+                except Exception as e:
+                    st.warning(f"⚠️ Error downloading {ticker}: {str(e)}")
                     continue
             
             if len(data_list) == 2:
                 result = pd.concat(data_list, axis=1)
                 result.columns = ['X2', 'X1']
                 result = result.ffill().dropna()
-                if not result.empty:
+                
+                if not result.empty and len(result) > 20:
+                    st.success(f"✅ Data loaded: {len(result)} days ({ticker_names[0]}, {ticker_names[1]})")
                     return result
+                else:
+                    st.warning(f"⚠️ Insufficient data: only {len(result)} days")
+            
+            elif len(data_list) == 1:
+                st.error(f"❌ Only loaded {ticker_names[0]}. Need 2 tickers.")
+            else:
+                st.error(f"❌ Failed to load any data on attempt {attempt + 1}/3")
+        
         except Exception as e:
             if attempt == 2:
-                print(f"Error fetching data: {e}")
+                st.error(f"❌ Final error: {str(e)}")
             continue
     
     return pd.DataFrame()
@@ -558,16 +604,30 @@ with st.sidebar:
             for ticker in tickers[:2]:
                 try:
                     test = yf.Ticker(ticker)
-                    info = test.info
-                    if info and 'regularMarketPrice' in info:
-                        valid_tickers.append(f"✅ {ticker}")
+                    # Try to get recent data
+                    hist = test.history(period="5d")
+                    
+                    if not hist.empty:
+                        last_price = hist['Close'].iloc[-1]
+                        valid_tickers.append(f"✅ {ticker} - ${last_price:.2f}")
                     else:
-                        valid_tickers.append(f"⚠️ {ticker} (limited data)")
-                except:
-                    valid_tickers.append(f"❌ {ticker} (invalid)")
+                        valid_tickers.append(f"⚠️ {ticker} - No recent data")
+                except Exception as e:
+                    valid_tickers.append(f"❌ {ticker} - {str(e)[:30]}")
             
             for v in valid_tickers:
                 st.write(v)
+            
+            # Test actual download
+            st.write("\n**Testing download...**")
+            test_start = datetime.now() - timedelta(days=30)
+            test_end = datetime.now()
+            test_data = get_data_legacy(tickers, test_start, test_end)
+            
+            if not test_data.empty:
+                st.success(f"✅ Download successful: {len(test_data)} days")
+            else:
+                st.error("❌ Download failed - try different tickers")
     
     period_options = ["YTD", "1Y", "3YR", "5YR", "2022", "2008", "Custom"]
     sel_period = st.selectbox("Analysis Period", period_options, index=4)
@@ -737,31 +797,82 @@ with st.sidebar:
             st.rerun()
 
 # Main Content
-data = get_data_legacy(tickers, start_d, end_d)
+st.markdown("---")
+st.markdown("### 📊 Data Loading & Analysis")
+
+# Show loading status
+with st.spinner(f"Loading data for {tickers[0]} and {tickers[1]}..."):
+    data = get_data_legacy(tickers, start_d, end_d)
 
 if data.empty:
     st.error("⚠️ Unable to retrieve market data")
     
-    with st.expander("💡 Troubleshooting"):
+    # Show detailed diagnostics
+    st.markdown("### 🔍 Diagnostics")
+    
+    diag_col1, diag_col2 = st.columns(2)
+    
+    with diag_col1:
+        st.write("**Selected Configuration:**")
+        st.write(f"• Risk Asset: `{tickers[0]}`")
+        st.write(f"• Safe Asset: `{tickers[1]}`")
+        st.write(f"• Period: {start_d} to {end_d}")
+        st.write(f"• Days: {(end_d - start_d).days}")
+    
+    with diag_col2:
+        st.write("**Quick Test:**")
+        # Try to fetch just 1 week of data for each ticker
+        for ticker in tickers[:2]:
+            try:
+                test = yf.download(ticker, period="5d", progress=False)
+                if not test.empty:
+                    st.write(f"✅ {ticker}: {len(test)} days available")
+                else:
+                    st.write(f"❌ {ticker}: No data")
+            except Exception as e:
+                st.write(f"❌ {ticker}: {str(e)[:40]}")
+    
+    with st.expander("💡 Troubleshooting Guide"):
         st.markdown("""
-        **Possible causes:**
+        **Common Issues & Solutions:**
         
-        1. **Invalid tickers** - Click "🔍 Validate Tickers" button in sidebar
-        2. **European markets** - Try US equivalents:
-           - LQQ.PA → QLD (Nasdaq 2x US)
-           - PUST.PA → SPY (S&P 500)
-        3. **Data availability** - Some tickers have limited historical data
-        4. **Network issues** - Check internet connection
+        ### 1. European Tickers (.PA, .L, etc.)
+        - Some European tickers have limited data on Yahoo Finance
+        - **Solution**: Use US equivalents:
+          - `LQQ.PA` → `QLD` (Nasdaq 100 2x)
+          - `PUST.PA` → `SPY` (S&P 500)
         
-        **Recommended presets that work well:**
-        - ✅ S&P 500 2x / SPY (SSO, SPY)
-        - ✅ Nasdaq 100 2x / QQQ (QLD, QQQ)
-        - ✅ Tech / Bonds (XLK, TLT)
-        - ✅ S&P 500 / Bonds (SPY, TLT)
+        ### 2. Leveraged ETFs
+        - 2x/3x leveraged ETFs may have shorter history
+        - **Solution**: Check inception date, use shorter periods
         
-        **Try these tickers:**
-        - Risk: SSO, QLD, UPRO, TQQQ, XLK
-        - Safe: SPY, QQQ, TLT, IEF, AGG
+        ### 3. Network/API Issues
+        - Yahoo Finance API can be temporarily unavailable
+        - **Solution**: Wait a few minutes and try again
+        
+        ### 4. Invalid Ticker Symbols
+        - Typos or delisted securities
+        - **Solution**: Click "🔍 Validate Tickers" above
+        
+        ### ✅ Recommended Working Combinations:
+        
+        **US Markets (Most Reliable):**
+        - `SSO` / `SPY` - S&P 500 2x / S&P 500
+        - `QLD` / `QQQ` - Nasdaq 100 2x / Nasdaq 100
+        - `XLK` / `TLT` - Technology / Bonds
+        - `SPY` / `TLT` - S&P 500 / Bonds
+        - `UWM` / `IWM` - Russell 2000 2x / Russell 2000
+        
+        **Alternative Safe Assets:**
+        - `IEF` - 7-10 Year Treasury Bonds
+        - `AGG` - Aggregate Bond Index
+        - `BIL` - 1-3 Month T-Bills
+        - `GLD` - Gold
+        
+        **Try This:**
+        1. Select a preset like "S&P 500 2x / SPY"
+        2. Use period "2022" or "1Y" instead of custom dates
+        3. Click "🔍 Validate Tickers" first
         """)
     
     st.stop()

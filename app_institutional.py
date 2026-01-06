@@ -1213,4 +1213,6 @@ with tabs[4]:
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #606060; font-size: 10px; padding: 16px 0; text-transform: uppercase; letter-spacing: 0.1em;">
-    PREDICT. INSTITUTIONAL ANALYTICS v6.0
+    PREDICT. INSTITUTIONAL ANALYTICS v6.0 • ENTERPRISE EDITION
+</div>
+""", unsafe_allow_html=True)

@@ -1,7 +1,7 @@
 """
 PREDICT. - Institutional Analytics Platform v6.0
 Complete Implementation with Bayesian Optimization and Walk-Forward Validation
-FIXED: Data Retrieval & Standalone Architecture
+FIXED: Data Retrieval & Standalone Architecture & PM Shadow Overlay Integration
 """
 import sys
 import importlib
@@ -160,26 +160,19 @@ def get_data_legacy(tickers, start, end):
         df = yf.download(tickers[:2], start=start, end=end, progress=False, auto_adjust=True)
         
         # Handle MultiIndex columns (common in new yfinance)
-        # Structure might be (Price, Ticker) or just (Ticker) if Price is implicit
         if isinstance(df.columns, pd.MultiIndex):
-            # If 'Close' is in the first level
             if 'Close' in df.columns.get_level_values(0):
                 df = df['Close']
-            # If 'Adj Close' is in the first level
             elif 'Adj Close' in df.columns.get_level_values(0):
                 df = df['Adj Close']
         
         # Ensure we have the right columns
         if len(df.columns) >= 2:
-            # Reorder to match input tickers [Risk, Safe]
-            # yfinance sorts alphabetically, we need to respect input order
             available_cols = list(df.columns)
-            
-            # Map tickers to columns (handle potential formatting diffs)
             col_map = {}
             for t in tickers[:2]:
                 for c in available_cols:
-                    if t.upper() in c.upper(): # Loose matching
+                    if t.upper() in c.upper(): 
                         col_map[t] = c
                         break
             
@@ -194,15 +187,12 @@ def get_data_legacy(tickers, start, end):
     except Exception as e:
         print(f"Bulk download failed: {e}")
 
-    # Fallback: Individual download (slower but safer)
+    # Fallback: Individual download
     try:
         data_list = []
         for ticker in tickers[:2]:
             try:
-                # Force simple structure
                 df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
-                
-                # Extract the price series
                 if 'Close' in df.columns:
                     data_list.append(df['Close'])
                 elif 'Adj Close' in df.columns:
@@ -210,7 +200,6 @@ def get_data_legacy(tickers, start, end):
                 elif isinstance(df, pd.Series):
                     data_list.append(df)
                 else:
-                    # Attempt to find any numeric column
                     numeric_cols = df.select_dtypes(include=[np.number]).columns
                     if len(numeric_cols) > 0:
                         data_list.append(df[numeric_cols[0]])
@@ -470,15 +459,9 @@ class PMShadowEngine:
         """STEP 3: Traduire Conviction en Allocation %"""
         allocs = pd.DataFrame(index=scores_df.index)
         
-        # Mapping Linéaire : 
-        # Score -1 => 0% Risk (100% Safe)
-        # Score +1 => 100% Risk (0% Safe)
-        # Formule : (Score + 1) / 2
-        
+        # Mapping Linéaire
         target_risk_exposure = (scores_df['pm_conviction'] + 1) / 2
         
-        # On lisse les changements d'allocation (optionnel, pour éviter le trading excessif)
-        # Ici on applique directement pour être réactif
         allocs['alloc_risk'] = target_risk_exposure
         allocs['alloc_safe'] = 1 - target_risk_exposure
         
@@ -931,7 +914,9 @@ with st.sidebar:
             st.session_state.optimized_params = None
             st.rerun()
 
-# Main Content
+# ==========================================
+# MAIN CONTENT
+# ==========================================
 data = get_data_legacy(tickers, start_d, end_d)
 
 if data.empty:
@@ -942,10 +927,6 @@ if data.empty:
         1. **Invalid tickers** - Click "🔍 Validate Tickers" button in sidebar.
         2. **European markets** - Try US equivalents (LQQ.PA → QLD).
         3. **Data availability** - Some tickers have limited history.
-        
-        **Recommended presets that work well:**
-        - ✅ S&P 500 2x / SPY (SSO, SPY)
-        - ✅ Nasdaq 100 2x / QQQ (QLD, QQQ)
         """)
     st.stop()
 
@@ -960,49 +941,76 @@ sim_params = {
     'cost': 0.001
 }
 
+# 1. Run Strategy Simulation
 df_res, trades = BacktestEngine.run_simulation(data, sim_params)
 
 if df_res.empty:
     st.error("⚠ Simulation engine error")
     st.stop()
 
+# 2. Run PM Shadow Simulation (GLOBAL CALCULATION)
+# On calcule le PM Shadow ici pour qu'il soit disponible dans TOUS les onglets
+pm_engine = PMShadowEngine(data)
+pm_signals = pm_engine.generate_signals()
+pm_scores = pm_engine.calculate_conviction(pm_signals)
+pm_allocs = pm_engine.calculate_allocation(pm_scores)
+pm_nav_df = pm_engine.calculate_nav(pm_allocs)
+
+# Synchronisation du PM Shadow avec la Stratégie pour l'affichage
+# On reindex pour aligner les dates et on remplit les trous du début (warm-up) avec 100
+df_res['pm_shadow'] = pm_nav_df['pm_nav'].reindex(df_res.index).fillna(100)
+
+# 3. Calculate Metrics
 met_strat = calculate_metrics_legacy(df_res['strategy'])
 met_x2 = calculate_metrics_legacy(df_res['bench_x2'])
 met_x1 = calculate_metrics_legacy(df_res['bench_x1'])
+# Metrics PM pour comparaison rapide
+met_pm = calculate_metrics_legacy(df_res['pm_shadow'])
 
-# --- MODIFIED: Added "👥 PM Shadow" to tabs list ---
+# --- TABS ---
 tabs = st.tabs(["Performance", "Risk Analytics", "Allocation", "Trades", "👥 PM Shadow"])
 
 # TAB 1: Performance
 with tabs[0]:
-    # Calcul des Deltas (Comparaison vs Benchmark X2 - Actif Risqué)
+    # --- DATE DISPLAY (NEW) ---
+    start_str = df_res.index[0].strftime('%d %b %Y')
+    end_str = df_res.index[-1].strftime('%d %b %Y')
+    duration_years = (df_res.index[-1] - df_res.index[0]).days / 365.25
+    
+    st.markdown(f"""
+    <div style="background-color: #1A1A1A; padding: 10px; border-radius: 5px; border: 1px solid #2A2A2A; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;">
+        <span style="color: #A0A0A0; font-size: 12px; font-weight: 600;">📅 PERIOD: <span style="color: #FFFFFF;">{start_str} — {end_str}</span></span>
+        <span style="color: #A0A0A0; font-size: 12px;">DURATION: <span style="color: #FFFFFF;">{duration_years:.1f} Years</span></span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Calcul des Deltas
     cagr_delta = met_strat['CAGR'] - met_x2['CAGR']
     sharpe_delta = met_strat['Sharpe'] - met_x2['Sharpe']
     sortino_delta = met_strat['Sortino'] - met_x2['Sortino']
-    # Pour le DD: Si Strat -10% et Bench -30% => -10 - (-30) = +20% (C'est une amélioration, donc vert)
     dd_delta = met_strat['MaxDD'] - met_x2['MaxDD'] 
     omega_delta = met_strat['Omega'] - met_x2['Omega']
     
-    # Calcul durée moyenne de détention pour le contexte "Trades"
     avg_hold_days = len(df_res) / len(trades) if len(trades) > 0 else 0
 
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     
-    # Affichage avec les indicateurs de performance (vs Benchmark)
     k1.metric("CAGR", f"{met_strat['CAGR']:.2f}%", f"{cagr_delta:+.2f}% vs Bmk")
     k2.metric("Sharpe", f"{met_strat['Sharpe']:.3f}", f"{sharpe_delta:+.3f}")
     k3.metric("Sortino", f"{met_strat['Sortino']:.3f}", f"{sortino_delta:+.3f}")
     k4.metric("Max DD", f"{met_strat['MaxDD']:.2f}%", f"{dd_delta:+.2f}%")
     k5.metric("Omega", f"{met_strat['Omega']:.3f}", f"{omega_delta:+.3f}")
-    # delta_color="off" pour afficher en gris (info neutre)
     k6.metric("Trades", len(trades), f"~{avg_hold_days:.0f} days avg", delta_color="off")
     
     st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
     
+    # --- CHART WITH PM SHADOW (UPDATED) ---
     st.markdown("#### Cumulative Performance")
-    chart_data = df_res[['strategy', 'bench_x2', 'bench_x1']].copy()
-    chart_data.columns = ['Strategy', f'{tickers[0]} (Risk)', f'{tickers[1]} (Safe)']
-    st.line_chart(chart_data, height=400)
+    # On ajoute 'pm_shadow' aux données du graphique
+    chart_data = df_res[['strategy', 'pm_shadow', 'bench_x2', 'bench_x1']].copy()
+    chart_data.columns = ['Strategy A', 'PM Shadow (Quant)', f'{tickers[0]} (Risk)', f'{tickers[1]} (Safe)']
+    
+    st.line_chart(chart_data, height=450)
     
     st.markdown("#### Asset Allocation")
     alloc_data = df_res[['alloc_x2', 'alloc_x1']].copy()
@@ -1011,14 +1019,18 @@ with tabs[0]:
     
     st.markdown("#### Performance Comparison")
     perf_df = pd.DataFrame({
-        "Metric": ["Total Return", "CAGR", "Max Drawdown", "Volatility", "Sharpe", "Sortino", "Calmar"],
-        "Strategy": [
+        "Metric": ["Total Return", "CAGR", "Max Drawdown", "Volatility", "Sharpe", "Sortino"],
+        "Strategy A": [
             f"{met_strat['Cumul']:.2f}%", f"{met_strat['CAGR']:.2f}%", f"{met_strat['MaxDD']:.2f}%", 
-            f"{met_strat['Vol']:.2f}%", f"{met_strat['Sharpe']:.3f}", f"{met_strat['Sortino']:.3f}", f"{met_strat['Calmar']:.3f}"
+            f"{met_strat['Vol']:.2f}%", f"{met_strat['Sharpe']:.3f}", f"{met_strat['Sortino']:.3f}"
         ],
-        f"{tickers[0]}": [
+        "PM Shadow": [
+            f"{met_pm['Cumul']:.2f}%", f"{met_pm['CAGR']:.2f}%", f"{met_pm['MaxDD']:.2f}%", 
+            f"{met_pm['Vol']:.2f}%", f"{met_pm['Sharpe']:.3f}", f"{met_pm['Sortino']:.3f}"
+        ],
+        f"{tickers[0]} (Risk)": [
             f"{met_x2['Cumul']:.2f}%", f"{met_x2['CAGR']:.2f}%", f"{met_x2['MaxDD']:.2f}%", 
-            f"{met_x2['Vol']:.2f}%", f"{met_x2['Sharpe']:.3f}", f"{met_x2['Sortino']:.3f}", f"{met_x2['Calmar']:.3f}"
+            f"{met_x2['Vol']:.2f}%", f"{met_x2['Sharpe']:.3f}", f"{met_x2['Sortino']:.3f}"
         ]
     })
     st.dataframe(perf_df, use_container_width=True, hide_index=True)
@@ -1036,8 +1048,10 @@ with tabs[1]:
     
     st.markdown("#### Drawdown Analysis")
     dd_strat = (df_res['strategy'] / df_res['strategy'].cummax() - 1) * 100
+    dd_pm = (df_res['pm_shadow'] / df_res['pm_shadow'].cummax() - 1) * 100
     dd_x2 = (df_res['bench_x2'] / df_res['bench_x2'].cummax() - 1) * 100
-    dd_chart = pd.DataFrame({'Strategy': dd_strat, f'{tickers[0]}': dd_x2})
+    
+    dd_chart = pd.DataFrame({'Strategy': dd_strat, 'PM Shadow': dd_pm, f'{tickers[0]}': dd_x2})
     st.line_chart(dd_chart, height=300)
 
 # TAB 3: Allocation
@@ -1145,70 +1159,41 @@ with tabs[3]:
     else:
         st.info("ℹ️ No regime transitions occurred (stayed in R0 - Offensive)")
 
-# --- TAB 5: PM SHADOW (UPDATED UI) ---
+# --- TAB 5: PM SHADOW (UPDATED) ---
 with tabs[4]:
     st.markdown("#### 👥 PM Shadow Overlay")
     st.info("Simulation d'un gestionnaire quantitatif (Shadow PM) comparé à la Stratégie A.")
 
-    if not data.empty:
-        pm_engine = PMShadowEngine(data)
-        
-        # --- CALCULS ---
-        # 1. Signaux & Conviction
-        pm_signals = pm_engine.generate_signals()
-        pm_scores = pm_engine.calculate_conviction(pm_signals)
-        
-        # 2. Allocation & NAV (Nouveaux Steps)
-        pm_allocs = pm_engine.calculate_allocation(pm_scores)
-        pm_nav = pm_engine.calculate_nav(pm_allocs)
-        
-        # --- VISUALISATION ---
-        
-        # Metrics "Live" (Dernier jour connu)
-        last_score = pm_scores['pm_conviction'].iloc[-1]
-        last_alloc_risk = pm_allocs['alloc_risk'].iloc[-1] * 100
-        
-        # Performance finale (CAGR approx simple pour l'affichage)
-        if not pm_nav.empty:
-            total_ret_pm = (pm_nav['pm_nav'].iloc[-1] / pm_nav['pm_nav'].iloc[0]) - 1
-            days = len(pm_nav)
-            cagr_pm = ((1 + total_ret_pm) ** (365/days) - 1) * 100
-        else:
-            cagr_pm = 0
+    # Note: Calculs déjà faits au début (Global)
+    # Visualisation uniquement ici
+    
+    # Metrics "Live" (Dernier jour connu)
+    last_score = pm_scores['pm_conviction'].iloc[-1]
+    last_alloc_risk = pm_allocs['alloc_risk'].iloc[-1] * 100
+    
+    col_pm1, col_pm2, col_pm3, col_pm4 = st.columns(4)
+    col_pm1.metric("PM Conviction", f"{last_score:.2f}")
+    col_pm2.metric("PM Exposure (Risk)", f"{last_alloc_risk:.0f}%")
+    col_pm3.metric("PM Shadow CAGR", f"{met_pm['CAGR']:.2f}%")
+    
+    delta_perf = met_pm['Cumul'] - met_strat['Cumul']
+    col_pm4.metric("Delta vs Strategy A", f"{delta_perf:+.2f}%", help="Différence de rendement cumulé")
 
-        # KPI Cards
-        col_pm1, col_pm2, col_pm3, col_pm4 = st.columns(4)
-        col_pm1.metric("PM Conviction", f"{last_score:.2f}")
-        col_pm2.metric("PM Exposure (Risk)", f"{last_alloc_risk:.0f}%")
-        col_pm3.metric("PM Shadow CAGR", f"{cagr_pm:.2f}%")
-        
-        # Comparaison Stratégie A vs PM Shadow
-        # On normalise Stratégie A sur la même période que PM Shadow
-        strat_nav = df_res['strategy'].reindex(pm_nav.index)
-        strat_nav = (strat_nav / strat_nav.iloc[0]) * 100 # Rebase 100
-        
-        delta_perf = total_ret_pm * 100 - ((strat_nav.iloc[-1]/100 - 1)*100)
-        col_pm4.metric("Delta vs Strategy A", f"{delta_perf:+.2f}%", help="Différence de rendement total")
-
-        st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-        
-        # GRAPHIQUE 1 : PERFORMANCE COMPARÉE
-        st.markdown("#### 📈 Overlay de Performance (Base 100)")
-        chart_data = pd.DataFrame({
-            'Strategy A (Algorithmic)': strat_nav,
-            'PM Shadow (Quant Model)': pm_nav['pm_nav']
-        })
-        st.line_chart(chart_data, height=350)
-        
-        # GRAPHIQUE 2 : ALLOCATION DYNAMIQUE PM
-        st.markdown("#### 🧠 Conviction & Allocation du Shadow PM")
-        
-        # On plot l'allocation en actif risqué (Area chart)
-        st.area_chart(pm_allocs['alloc_risk'] * 100, height=200, color="#3B82F6")
-        st.caption("Zone Bleue = % d'exposition à l'actif risqué (LQQ/Risk) décidé par le Shadow PM.")
-
-    else:
-        st.warning("En attente des données...")
+    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+    
+    # GRAPHIQUE 1 : PERFORMANCE COMPARÉE
+    st.markdown("#### 📈 Overlay de Performance (Base 100)")
+    # On normalise tout à 100
+    overlay_chart = pd.DataFrame({
+        'Strategy A': (df_res['strategy'] / df_res['strategy'].iloc[0]) * 100,
+        'PM Shadow': (df_res['pm_shadow'] / df_res['pm_shadow'].iloc[0]) * 100
+    })
+    st.line_chart(overlay_chart, height=350)
+    
+    # GRAPHIQUE 2 : ALLOCATION DYNAMIQUE PM
+    st.markdown("#### 🧠 Conviction & Allocation du Shadow PM")
+    st.area_chart(pm_allocs['alloc_risk'] * 100, height=200, color="#3B82F6")
+    st.caption("Zone Bleue = % d'exposition à l'actif risqué (LQQ/Risk) décidé par le Shadow PM.")
 
 st.markdown("---")
 st.markdown("""

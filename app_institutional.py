@@ -3,6 +3,36 @@ PREDICT. - Institutional Analytics Platform
 Enhanced with Multi-Asset Data Engine, Vectorized Backtest, Bayesian Optimization, and Walk-Forward Validation
 """
 
+# Check for required packages
+import sys
+import importlib
+
+required_packages = {
+    'streamlit': 'streamlit',
+    'yfinance': 'yfinance',
+    'pandas': 'pandas',
+    'numpy': 'numpy',
+    'scipy': 'scipy'
+}
+
+missing_packages = []
+for package_import, package_name in required_packages.items():
+    try:
+        importlib.import_module(package_import)
+    except ImportError:
+        missing_packages.append(package_name)
+
+if missing_packages:
+    print("\n" + "="*60)
+    print("ERROR: Missing required packages")
+    print("="*60)
+    print("\nPlease install the following packages:")
+    print(f"\npip install {' '.join(missing_packages)}")
+    print("\nOr install all requirements:")
+    print("pip install -r requirements.txt")
+    print("\n" + "="*60 + "\n")
+    sys.exit(1)
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -12,9 +42,14 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Import new modules
-from data_engine import DataEngine, AdvancedMetrics
-from backtest_engine import VectorizedBacktestEngine, RegimeDetector
-from optimizer import BayesianOptimizer, WalkForwardValidator
+try:
+    from data_engine import DataEngine, AdvancedMetrics
+    from backtest_engine import VectorizedBacktestEngine, RegimeDetector
+    from optimizer import BayesianOptimizer, WalkForwardValidator
+    ADVANCED_FEATURES = True
+except ImportError as e:
+    ADVANCED_FEATURES = False
+    print(f"Warning: Advanced features not available - {e}")
 
 # ==========================================
 # CONFIGURATION
@@ -332,25 +367,48 @@ st.markdown("""
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_data_legacy(tickers, start, end):
-    """Legacy function - wrapper around DataEngine"""
+    """Legacy function - wrapper around DataEngine with retry logic"""
     if len(tickers) < 2:
         return pd.DataFrame()
     
-    engine = DataEngine(tickers[:2], start, end)
-    prices = engine.fetch_multi_asset()
-    
-    if prices.empty:
-        return pd.DataFrame()
-    
-    clean_prices = engine.clean_data()
-    
-    # Return in legacy format (X2 = risk, X1 = safe)
-    if len(clean_prices.columns) >= 2:
-        result = pd.DataFrame({
-            'X2': clean_prices.iloc[:, 0],
-            'X1': clean_prices.iloc[:, 1]
-        })
-        return result
+    # Try multiple times with different methods
+    for attempt in range(3):
+        try:
+            if ADVANCED_FEATURES:
+                engine = DataEngine(tickers[:2], start, end)
+                prices = engine.fetch_multi_asset()
+                
+                if not prices.empty:
+                    clean_prices = engine.clean_data()
+                    
+                    # Return in legacy format (X2 = risk, X1 = safe)
+                    if len(clean_prices.columns) >= 2:
+                        result = pd.DataFrame({
+                            'X2': clean_prices.iloc[:, 0],
+                            'X1': clean_prices.iloc[:, 1]
+                        })
+                        return result
+            else:
+                # Fallback to simple yfinance
+                data_list = []
+                for ticker in tickers[:2]:
+                    try:
+                        df = yf.download(ticker, start=start, end=end, progress=False)
+                        if not df.empty and 'Adj Close' in df.columns:
+                            data_list.append(df['Adj Close'])
+                    except:
+                        continue
+                
+                if len(data_list) == 2:
+                    result = pd.concat(data_list, axis=1)
+                    result.columns = ['X2', 'X1']
+                    result = result.ffill().dropna()
+                    if not result.empty:
+                        return result
+        except Exception as e:
+            if attempt == 2:
+                print(f"Error fetching data: {e}")
+            continue
     
     return pd.DataFrame()
 
@@ -534,6 +592,10 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+# Show advanced features status
+if not ADVANCED_FEATURES:
+    st.warning("⚠️ Advanced modules not loaded. Using legacy mode. Install requirements: pip install -r requirements.txt")
+
 # ==========================================
 # SIDEBAR - CONFIGURATION
 # ==========================================
@@ -541,19 +603,41 @@ with st.sidebar:
     st.markdown('<div class="section-header">Portfolio Configuration</div>', unsafe_allow_html=True)
     
     presets = {
-        "Nasdaq 100 (Amundi)": ["LQQ.PA", "PUST.PA"],
-        "S&P 500 (US)": ["SSO", "SPY"],
+        "S&P 500 2x / SPY": ["SSO", "SPY"],
+        "Nasdaq 100 2x / QQQ": ["QLD", "QQQ"],
+        "Tech / Bonds": ["XLK", "TLT"],
+        "S&P 500 / Bonds": ["SPY", "TLT"],
+        "Nasdaq 100 (EU)": ["LQQ.PA", "PUST.PA"],
+        "Russell 2000 2x / IWM": ["UWM", "IWM"],
         "Custom": []
     }
     
     sel_preset = st.selectbox("Asset Universe", list(presets.keys()), key='preset')
     
     if sel_preset == "Custom":
-        t_input = st.text_input("Tickers (Risk, Safe)", "LQQ.PA, PUST.PA")
+        t_input = st.text_input("Tickers (Risk, Safe)", "SPY, TLT")
         tickers = [t.strip().upper() for t in t_input.split(',')]
     else:
         tickers = presets[sel_preset]
         st.caption(f"**Risk:** {tickers[0]} | **Safe:** {tickers[1]}")
+    
+    # Add ticker validation button
+    if st.button("🔍 Validate Tickers", use_container_width=True):
+        with st.spinner("Checking tickers..."):
+            valid_tickers = []
+            for ticker in tickers[:2]:
+                try:
+                    test = yf.Ticker(ticker)
+                    info = test.info
+                    if info and 'regularMarketPrice' in info:
+                        valid_tickers.append(f"✅ {ticker}")
+                    else:
+                        valid_tickers.append(f"⚠️ {ticker} (limited data)")
+                except:
+                    valid_tickers.append(f"❌ {ticker} (invalid)")
+            
+            for v in valid_tickers:
+                st.write(v)
     
     period_options = ["YTD", "1Y", "3YR", "5YR", "2022", "2008", "Custom"]
     sel_period = st.selectbox("Analysis Period", period_options, index=4)
@@ -614,7 +698,31 @@ with st.sidebar:
 data = get_data_legacy(tickers, start_d, end_d)
 
 if data.empty:
-    st.error(f"⚠ Unable to retrieve market data for {tickers}")
+    st.error("⚠️ Unable to retrieve market data")
+    
+    with st.expander("💡 Troubleshooting"):
+        st.markdown("""
+        **Possible causes:**
+        
+        1. **Invalid tickers** - Click "🔍 Validate Tickers" button in sidebar
+        2. **European markets** - Try US equivalents:
+           - LQQ.PA → QLD (Nasdaq 2x US)
+           - PUST.PA → SPY (S&P 500)
+        3. **Data availability** - Some tickers have limited historical data
+        4. **Network issues** - Check internet connection
+        
+        **Recommended presets that work well:**
+        - ✅ S&P 500 2x / SPY (SSO, SPY)
+        - ✅ Nasdaq 100 2x / QQQ (QLD, QQQ)
+        - ✅ Tech / Bonds (XLK, TLT)
+        - ✅ S&P 500 / Bonds (SPY, TLT)
+        
+        **Try these tickers:**
+        - Risk: SSO, QLD, UPRO, TQQQ, XLK
+        - Safe: SPY, QQQ, TLT, IEF, AGG
+        """)
+    
+    st.stop()
 else:
     # Show data quality report
     engine = DataEngine(tickers[:2], start_d, end_d)

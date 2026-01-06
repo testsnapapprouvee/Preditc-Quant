@@ -1,6 +1,7 @@
 """
 PREDICT. - Institutional Analytics Platform v6.0
 Complete Implementation with Bayesian Optimization and Walk-Forward Validation
+FIXED: Data Retrieval & Standalone Architecture
 """
 import sys
 import importlib
@@ -80,6 +81,7 @@ class BayesianOptimizer:
             return 1e6
 
     def optimize(self):
+        # Using Differential Evolution as a robust global optimizer
         result = differential_evolution(
             func=self._objective_wrapper,
             bounds=self.bounds_array,
@@ -142,35 +144,87 @@ class MultiObjectiveScorer:
         return score
 
 # ==========================================
-# DATA & METRICS
+# DATA & METRICS (FIXED ROBUSTNESS)
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_data_legacy(tickers, start, end):
-    """Fetch market data with retry logic"""
+    """
+    Robust data fetcher handling various yfinance return formats.
+    Ensures data is retrieved even if structure varies.
+    """
     if len(tickers) < 2:
         return pd.DataFrame()
     
-    for attempt in range(3):
-        try:
-            data_list = []
-            for ticker in tickers[:2]:
-                try:
-                    df = yf.download(ticker, start=start, end=end, progress=False)
-                    if not df.empty and 'Adj Close' in df.columns:
-                        data_list.append(df['Adj Close'])
-                except:
-                    continue
+    # Try bulk download first (faster and often cleaner)
+    try:
+        df = yf.download(tickers[:2], start=start, end=end, progress=False, auto_adjust=True)
+        
+        # Handle MultiIndex columns (common in new yfinance)
+        # Structure might be (Price, Ticker) or just (Ticker) if Price is implicit
+        if isinstance(df.columns, pd.MultiIndex):
+            # If 'Close' is in the first level
+            if 'Close' in df.columns.get_level_values(0):
+                df = df['Close']
+            # If 'Adj Close' is in the first level
+            elif 'Adj Close' in df.columns.get_level_values(0):
+                df = df['Adj Close']
+        
+        # Ensure we have the right columns
+        if len(df.columns) >= 2:
+            # Reorder to match input tickers [Risk, Safe]
+            # yfinance sorts alphabetically, we need to respect input order
+            available_cols = list(df.columns)
             
-            if len(data_list) == 2:
-                result = pd.concat(data_list, axis=1)
-                result.columns = ['X2', 'X1']
+            # Map tickers to columns (handle potential formatting diffs)
+            col_map = {}
+            for t in tickers[:2]:
+                for c in available_cols:
+                    if t.upper() in c.upper(): # Loose matching
+                        col_map[t] = c
+                        break
+            
+            if len(col_map) == 2:
+                result = pd.DataFrame()
+                result['X2'] = df[col_map[tickers[0]]]
+                result['X1'] = df[col_map[tickers[1]]]
                 result = result.ffill().dropna()
                 if not result.empty:
                     return result
-        except Exception as e:
-            if attempt == 2:
-                print(f"Error fetching data: {e}")
-            continue
+
+    except Exception as e:
+        print(f"Bulk download failed: {e}")
+
+    # Fallback: Individual download (slower but safer)
+    try:
+        data_list = []
+        for ticker in tickers[:2]:
+            try:
+                # Force simple structure
+                df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+                
+                # Extract the price series
+                if 'Close' in df.columns:
+                    data_list.append(df['Close'])
+                elif 'Adj Close' in df.columns:
+                    data_list.append(df['Adj Close'])
+                elif isinstance(df, pd.Series):
+                    data_list.append(df)
+                else:
+                    # Attempt to find any numeric column
+                    numeric_cols = df.select_dtypes(include=[np.number]).columns
+                    if len(numeric_cols) > 0:
+                        data_list.append(df[numeric_cols[0]])
+            except:
+                continue
+        
+        if len(data_list) == 2:
+            result = pd.concat(data_list, axis=1)
+            result.columns = ['X2', 'X1']
+            result = result.ffill().dropna()
+            if not result.empty:
+                return result
+    except Exception as e:
+        print(f"Individual download failed: {e}")
             
     return pd.DataFrame()
 
@@ -401,7 +455,6 @@ def create_optimization_objective(backtest_func, calculate_metrics_func,
             return -score
             
         except Exception as e:
-            # print(f"Optimization error: {e}") 
             return 1e6
     
     return objective
@@ -645,11 +698,12 @@ with st.sidebar:
             for ticker in tickers[:2]:
                 try:
                     test = yf.Ticker(ticker)
-                    info = test.info
-                    if info and 'regularMarketPrice' in info:
+                    # Simple check that doesn't download full data
+                    hist = test.history(period="1d")
+                    if not hist.empty:
                         valid_tickers.append(f"✅ {ticker}")
                     else:
-                        valid_tickers.append(f"⚠️ {ticker} (limited data)")
+                        valid_tickers.append(f"⚠️ {ticker} (no data)")
                 except:
                     valid_tickers.append(f"❌ {ticker} (invalid)")
             
@@ -717,10 +771,6 @@ with st.sidebar:
         st.write(f"• **R0 (Offensive)**: 0% Safe, 100% Risk")
         st.write(f"• **R1 (Prudence)**: {alloc_prud}% Safe, {100-alloc_prud}% Risk")
         st.write(f"• **R2 (Crisis)**: {alloc_crash}% Safe, {100-alloc_crash}% Risk")
-        st.write("\n**Examples:**")
-        st.write("• Conservative: Prudence=70%, Crisis=100%")
-        st.write("• Moderate: Prudence=50%, Crisis=80%")
-        st.write("• Aggressive: Prudence=30%, Crisis=60%")
     
     confirm = st.slider("Confirmation Period (Days)", 1, 3, 2, 1)
 
@@ -728,16 +778,14 @@ with st.sidebar:
     st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-header">🚀 Bayesian Optimization</div>', unsafe_allow_html=True)
     
-    # UPDATED: Added 'PERFORMANCE ONLY' to selectbox
     profile = st.selectbox("Investment Objective", 
                           ["DEFENSIVE", "BALANCED", "AGGRESSIVE", "PERFORMANCE ONLY"], 
                           help="DEFENSIVE: Calmar focus | BALANCED: Sharpe focus | AGGRESSIVE: CAGR focus | PERFORMANCE ONLY: Pure CAGR")
     
-    opt_iterations = st.select_slider("Optimization Depth", options=[50, 100, 150, 200], value=100, help="More iterations = better results but slower")
-    use_dynamic_alloc = st.checkbox("🎯 Optimize Allocations", value=False, help="Optimize Prudence and Crisis allocation percentages")
+    opt_iterations = st.select_slider("Optimization Depth", options=[50, 100, 150, 200], value=100)
+    use_dynamic_alloc = st.checkbox("🎯 Optimize Allocations", value=False)
     
     st.caption(f"⏱️ **Expected time:** ~{opt_iterations//5}-{opt_iterations//2} seconds")
-    st.caption("💡 **Method:** Differential Evolution (no extra dependencies)")
     
     opt_col1, opt_col2 = st.columns(2)
     with opt_col1:
@@ -780,23 +828,6 @@ with st.sidebar:
                     st.session_state.using_optimized = True
                     
                     st.success("✅ Optimization Complete!")
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.write("**Best Parameters:**")
-                        st.write(f"• Threshold: **{best_params['thresh']:.1f}%**")
-                        st.write(f"• Panic: **{best_params['panic']:.0f}%**")
-                        st.write(f"• Recovery: **{best_params['recovery']:.0f}%**")
-                        if use_dynamic_alloc:
-                            st.write(f"• Prudence Alloc: **{best_params['allocPrudence']:.0f}%**")
-                            st.write(f"• Crisis Alloc: **{best_params['allocCrash']:.0f}%**")
-                    with col2:
-                        valid_results = (history['score'] < 1e5).sum()
-                        st.write("**Optimization Stats:**")
-                        st.write(f"• Score: **{-best_score:.3f}**")
-                        st.write(f"• Iterations: **{len(history)}**")
-                        st.write(f"• Valid: **{valid_results}**")
-                    
-                    st.info("💡 Adjust sliders above to apply these parameters")
                     st.rerun()
             else:
                 st.warning("⚠️ Load data first")
@@ -805,7 +836,6 @@ with st.sidebar:
         if st.button("🔄 RESET", use_container_width=True):
             st.session_state.using_optimized = False
             st.session_state.optimized_params = None
-            st.success("✅ Reset to defaults")
             st.rerun()
 
 # Main Content
@@ -816,22 +846,13 @@ if data.empty:
     with st.expander("💡 Troubleshooting"):
         st.markdown("""
         **Possible causes:**
-        1. **Invalid tickers** - Click "🔍 Validate Tickers" button in sidebar
-        2. **European markets** - Try US equivalents:
-           - LQQ.PA → QLD (Nasdaq 2x US)
-           - PUST.PA → SPY (S&P 500)
-        3. **Data availability** - Some tickers have limited historical data
-        4. **Network issues** - Check internet connection
+        1. **Invalid tickers** - Click "🔍 Validate Tickers" button in sidebar.
+        2. **European markets** - Try US equivalents (LQQ.PA → QLD).
+        3. **Data availability** - Some tickers have limited history.
         
         **Recommended presets that work well:**
         - ✅ S&P 500 2x / SPY (SSO, SPY)
         - ✅ Nasdaq 100 2x / QQQ (QLD, QQQ)
-        - ✅ Tech / Bonds (XLK, TLT)
-        - ✅ S&P 500 / Bonds (SPY, TLT)
-        
-        **Try these tickers:**
-        - Risk: SSO, QLD, UPRO, TQQQ, XLK
-        - Safe: SPY, QQQ, TLT, IEF, AGG
         """)
     st.stop()
 
@@ -984,9 +1005,6 @@ with tabs[2]:
     
     comparison_df = pd.DataFrame(static_results)
     st.dataframe(comparison_df, use_container_width=True, hide_index=True)
-    
-    st.markdown("**Interpretation:**")
-    st.write("Dynamic allocation should outperform most static allocations by adapting to market conditions.")
     
     best_static_sharpe = max([float(r['Sharpe']) for r in static_results[:-1]])
     if met_strat['Sharpe'] > best_static_sharpe:

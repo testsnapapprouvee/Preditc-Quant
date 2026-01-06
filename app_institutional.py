@@ -687,12 +687,52 @@ with st.sidebar:
                      key='recov_slider')
     
     st.markdown('<div class="section-header">Allocation Policy</div>', unsafe_allow_html=True)
-    alloc_prud = st.slider("Prudent Mode (X1%)", 0, 100, 50, 10)
-    alloc_crash = st.slider("Crisis Mode (X1%)", 0, 100, 100, 10)
+    
+    # Initialize allocation params if needed
+    if 'alloc_params' not in st.session_state:
+        st.session_state['alloc_params'] = {'allocPrudence': 50, 'allocCrash': 100}
+    
+    alloc_prud = st.slider("Prudent Mode (X1%)", 0, 100, 
+                          st.session_state['alloc_params']['allocPrudence'], 10,
+                          key='alloc_prud_slider',
+                          help="% allocated to safe asset in Prudence regime")
+    alloc_crash = st.slider("Crisis Mode (X1%)", 0, 100, 
+                           st.session_state['alloc_params']['allocCrash'], 10,
+                           key='alloc_crash_slider',
+                           help="% allocated to safe asset in Crisis regime")
+    
+    # Visual feedback
+    if alloc_crash < alloc_prud:
+        st.warning("⚠️ Crisis allocation should typically be ≥ Prudence allocation")
+    
+    # Show allocation breakdown
+    with st.expander("📊 Allocation Breakdown"):
+        st.write("**Regime Allocations:**")
+        st.write(f"• **R0 (Offensive)**: 0% Safe, 100% Risk")
+        st.write(f"• **R1 (Prudence)**: {alloc_prud}% Safe, {100-alloc_prud}% Risk")
+        st.write(f"• **R2 (Crisis)**: {alloc_crash}% Safe, {100-alloc_crash}% Risk")
+        
+        st.write("\n**Examples:**")
+        st.write("• Conservative: Prudence=70%, Crisis=100%")
+        st.write("• Moderate: Prudence=50%, Crisis=80%")
+        st.write("• Aggressive: Prudence=30%, Crisis=60%")
     confirm = st.slider("Confirmation Period (Days)", 1, 3, 2, 1)
     
     st.markdown('<div class="section-header">Advanced Optimization</div>', unsafe_allow_html=True)
+    
+    # Optimization mode selector
+    opt_mode = st.radio("Optimization Mode", 
+                        ["Standard (Fast)", "Extensive (Thorough)", "Ultra (Exhaustive)"],
+                        horizontal=True)
+    
     profile = st.selectbox("Investment Objective", ["DEFENSIVE", "BALANCED", "AGGRESSIVE"])
+    
+    # Add dynamic allocation toggle
+    use_dynamic_alloc = st.checkbox("🎯 Enable Dynamic Allocation", value=False,
+                                   help="Optimize allocation percentages instead of fixed 50%/100%")
+    
+    if use_dynamic_alloc:
+        st.caption("Will optimize Prudence and Crash allocation percentages")
     
     opt_col1, opt_col2 = st.columns(2)
     with opt_col1:
@@ -701,8 +741,8 @@ with st.sidebar:
             opt_data = get_data_legacy(tickers, start_d, end_d)
             
             if not opt_data.empty:
-                with st.spinner(f"Running {profile} optimization..."):
-                    # Define search space based on profile
+                # Define search space based on mode
+                if opt_mode == "Standard (Fast)":
                     if profile == "AGGRESSIVE":
                         thresholds = [2, 3, 4, 5, 6]
                         panics = [12, 15, 18, 20, 25]
@@ -716,73 +756,164 @@ with st.sidebar:
                         panics = [12, 15, 18, 20, 22]
                         recoveries = [25, 30, 35, 40, 45]
                     
+                    if use_dynamic_alloc:
+                        alloc_prudences = [30, 40, 50, 60, 70]
+                        alloc_crashes = [70, 80, 90, 100]
+                    else:
+                        alloc_prudences = [alloc_prud]
+                        alloc_crashes = [alloc_crash]
+                        
+                elif opt_mode == "Extensive (Thorough)":
+                    # More granular
+                    thresholds = np.arange(2, 10, 0.5).tolist()  # 2, 2.5, 3, ..., 9.5
+                    panics = list(range(10, 31, 2))  # 10, 12, 14, ..., 30
+                    recoveries = list(range(20, 61, 5))  # 20, 25, 30, ..., 60
+                    
+                    if use_dynamic_alloc:
+                        alloc_prudences = list(range(20, 81, 10))  # 20, 30, 40, ..., 80
+                        alloc_crashes = list(range(60, 101, 10))  # 60, 70, 80, 90, 100
+                    else:
+                        alloc_prudences = [alloc_prud]
+                        alloc_crashes = [alloc_crash]
+                        
+                else:  # Ultra (Exhaustive)
+                    # Maximum granularity
+                    thresholds = np.arange(2, 10, 0.25).tolist()  # Every 0.25%
+                    panics = list(range(10, 31, 1))  # Every 1%
+                    recoveries = list(range(20, 61, 2))  # Every 2%
+                    
+                    if use_dynamic_alloc:
+                        alloc_prudences = list(range(20, 81, 5))  # Every 5%
+                        alloc_crashes = list(range(60, 101, 5))  # Every 5%
+                    else:
+                        alloc_prudences = [alloc_prud]
+                        alloc_crashes = [alloc_crash]
+                
+                # Progress tracking
+                total_combinations = (len(thresholds) * len(panics) * len(recoveries) * 
+                                    len(alloc_prudences) * len(alloc_crashes))
+                
+                with st.spinner(f"Running {profile} optimization ({opt_mode})..."):
+                    st.info(f"Testing up to {total_combinations:,} combinations...")
+                    
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
                     best_score = -np.inf
                     best_params = None
                     best_metrics = None
                     tested = 0
+                    total_tested = 0
                     
-                    # Grid search
-                    for t in thresholds:
+                    # Grid search with progress
+                    for i, t in enumerate(thresholds):
                         for p in panics:
                             if p <= t:
                                 continue
                             for r in recoveries:
-                                test_params = {
-                                    'thresh': t,
-                                    'panic': p,
-                                    'recovery': r,
-                                    'allocPrudence': alloc_prud,
-                                    'allocCrash': alloc_crash,
-                                    'rollingWindow': 60,
-                                    'confirm': confirm,
-                                    'cost': 0.001
-                                }
-                                
-                                try:
-                                    res, trades = BacktestEngine.run_simulation(opt_data, test_params)
-                                    if res.empty:
-                                        continue
-                                    
-                                    metrics = calculate_metrics_legacy(res['strategy'])
-                                    
-                                    # Score based on profile
-                                    if profile == "DEFENSIVE":
-                                        score = metrics['Calmar']
-                                    elif profile == "BALANCED":
-                                        n_trades = len(trades)
-                                        turnover_penalty = max(0, (n_trades - 10) * 0.1)
-                                        score = metrics['Sharpe'] - turnover_penalty
-                                    else:  # AGGRESSIVE
-                                        score = metrics['CAGR'] if metrics['MaxDD'] > -35.0 else -1000
-                                    
-                                    if score > best_score:
-                                        best_score = score
-                                        best_params = {'thresh': t, 'panic': p, 'recovery': r}
-                                        best_metrics = metrics
-                                    
-                                    tested += 1
-                                except:
-                                    continue
+                                for ap in alloc_prudences:
+                                    for ac in alloc_crashes:
+                                        if ac < ap:  # Crash alloc must be >= prudence
+                                            continue
+                                            
+                                        total_tested += 1
+                                        
+                                        # Update progress every 50 tests
+                                        if total_tested % 50 == 0:
+                                            progress = min(total_tested / total_combinations, 1.0)
+                                            progress_bar.progress(progress)
+                                            status_text.text(f"Tested: {total_tested:,} | Best Score: {best_score:.3f}")
+                                        
+                                        test_params = {
+                                            'thresh': t,
+                                            'panic': p,
+                                            'recovery': r,
+                                            'allocPrudence': ap,
+                                            'allocCrash': ac,
+                                            'rollingWindow': 60,
+                                            'confirm': confirm,
+                                            'cost': 0.001
+                                        }
+                                        
+                                        try:
+                                            res, trades = BacktestEngine.run_simulation(opt_data, test_params)
+                                            if res.empty:
+                                                continue
+                                            
+                                            metrics = calculate_metrics_legacy(res['strategy'])
+                                            
+                                            # Score based on profile
+                                            if profile == "DEFENSIVE":
+                                                score = metrics['Calmar']
+                                            elif profile == "BALANCED":
+                                                n_trades = len(trades)
+                                                turnover_penalty = max(0, (n_trades - 10) * 0.1)
+                                                score = metrics['Sharpe'] - turnover_penalty
+                                            else:  # AGGRESSIVE
+                                                score = metrics['CAGR'] if metrics['MaxDD'] > -35.0 else -1000
+                                            
+                                            if score > best_score:
+                                                best_score = score
+                                                best_params = test_params.copy()
+                                                best_metrics = metrics
+                                            
+                                            tested += 1
+                                        except:
+                                            continue
+                    
+                    progress_bar.progress(1.0)
+                    status_text.empty()
                     
                     if best_params:
                         # Update session state
-                        st.session_state['params'] = best_params
+                        st.session_state['params'] = {
+                            'thresh': best_params['thresh'],
+                            'panic': best_params['panic'],
+                            'recovery': best_params['recovery']
+                        }
+                        st.session_state['alloc_params'] = {
+                            'allocPrudence': best_params['allocPrudence'],
+                            'allocCrash': best_params['allocCrash']
+                        }
                         st.session_state['opt_metrics'] = best_metrics
                         st.session_state['opt_score'] = best_score
+                        st.session_state['opt_tested'] = tested
+                        
+                        # DIRECT APPLICATION - Update sliders via keys
+                        st.session_state['thresh_slider'] = float(best_params['thresh'])
+                        st.session_state['panic_slider'] = int(best_params['panic'])
+                        st.session_state['recov_slider'] = int(best_params['recovery'])
+                        
+                        if use_dynamic_alloc:
+                            st.session_state['alloc_prud_slider'] = int(best_params['allocPrudence'])
+                            st.session_state['alloc_crash_slider'] = int(best_params['allocCrash'])
                         
                         # Show results
                         st.success(f"✅ Optimization Complete!")
-                        st.write(f"**Best Parameters Found** (tested {tested} combinations):")
-                        st.write(f"• Threshold: **{best_params['thresh']}%**")
-                        st.write(f"• Panic: **{best_params['panic']}%**")
-                        st.write(f"• Recovery: **{best_params['recovery']}%**")
-                        st.write(f"\n**Expected Performance:**")
-                        st.write(f"• CAGR: **{best_metrics['CAGR']:.2f}%**")
-                        st.write(f"• Sharpe: **{best_metrics['Sharpe']:.2f}**")
-                        st.write(f"• Max DD: **{best_metrics['MaxDD']:.2f}%**")
-                        st.write(f"• Score: **{best_score:.3f}**")
                         
-                        st.info("⚠️ **Refresh the page (F5)** to see strategy with optimized parameters")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.write(f"**Parameters Found** ({tested:,}/{total_tested:,} valid):")
+                            st.write(f"• Threshold: **{best_params['thresh']}%**")
+                            st.write(f"• Panic: **{best_params['panic']}%**")
+                            st.write(f"• Recovery: **{best_params['recovery']}%**")
+                            
+                            if use_dynamic_alloc:
+                                st.write(f"\n**Allocations:**")
+                                st.write(f"• Prudence: **{best_params['allocPrudence']}%** → Safe Asset")
+                                st.write(f"• Crash: **{best_params['allocCrash']}%** → Safe Asset")
+                        
+                        with col2:
+                            st.write(f"**Expected Performance:**")
+                            st.write(f"• CAGR: **{best_metrics['CAGR']:.2f}%**")
+                            st.write(f"• Sharpe: **{best_metrics['Sharpe']:.2f}**")
+                            st.write(f"• Max DD: **{best_metrics['MaxDD']:.2f}%**")
+                            st.write(f"• Score: **{best_score:.3f}**")
+                        
+                        st.info("✨ **Parameters applied automatically** - strategy will update below")
+                        
+                        # Force rerun to apply new parameters
+                        st.rerun()
                     else:
                         st.error("❌ Optimization failed - no valid parameters found")
             else:
@@ -792,8 +923,16 @@ with st.sidebar:
         if st.button("📊 RESET", use_container_width=True):
             # Reset to defaults
             st.session_state['params'] = {'thresh': 5.0, 'panic': 15, 'recovery': 30}
+            st.session_state['alloc_params'] = {'allocPrudence': 50, 'allocCrash': 100}
+            
+            # Clear optimization results
+            if 'opt_metrics' in st.session_state:
+                del st.session_state['opt_metrics']
+            if 'opt_score' in st.session_state:
+                del st.session_state['opt_score']
+            
             st.success("✅ Reset to default parameters")
-            st.info("⚠️ **Refresh the page (F5)** to apply reset")
+            st.rerun()
 
 # ==========================================
 # MAIN CONTENT
@@ -865,7 +1004,7 @@ else:
         # Advanced metrics
         adv_metrics = AdvancedMetrics.calculate_comprehensive_metrics(df_res['strategy'])
         
-        tabs = st.tabs(["Performance", "Risk Analytics", "Advanced Metrics", "Optimization", "Validation"])
+        tabs = st.tabs(["Performance", "Risk Analytics", "Advanced Metrics", "Dynamic Allocation", "Optimization", "Validation"])
         
         # TAB 1: PERFORMANCE
         with tabs[0]:
@@ -913,10 +1052,17 @@ else:
                            "Better" if improvement > 0 else "Worse",
                            delta_color="normal" if improvement > 0 else "inverse")
                 
+                # Show optimized parameters used
+                if 'alloc_params' in st.session_state:
+                    st.write(f"\n**Optimized Allocations:** Prudence={st.session_state['alloc_params']['allocPrudence']}%, Crisis={st.session_state['alloc_params']['allocCrash']}%")
+                
+                if 'opt_tested' in st.session_state:
+                    st.caption(f"Based on {st.session_state['opt_tested']:,} valid combinations tested")
+                
                 if improvement < -5:
-                    st.warning("⚠️ Current parameters underperform optimized. Click OPTIMIZE again or adjust sliders.")
+                    st.warning("⚠️ Current parameters underperform optimized. Consider re-optimizing or adjusting sliders.")
                 elif improvement > 5:
-                    st.success("✅ Current parameters outperform optimization! Good manual tuning.")
+                    st.success("✅ Current parameters outperform optimization! Excellent manual tuning.")
                 else:
                     st.info("ℹ️ Current performance close to optimized.")
             
@@ -1005,7 +1151,134 @@ else:
             cr3.metric("Up Capture", f"{adv_metrics['up_capture']:.2f}%")
             cr4.metric("Down Capture", f"{adv_metrics['down_capture']:.2f}%")
         
-        # TAB 4: OPTIMIZATION
+        # TAB 4: DYNAMIC ALLOCATION
+        with tabs[3]:
+            st.markdown("#### 🎯 Allocation Analysis")
+            
+            # Allocation statistics
+            alloc_stats = df_res[['alloc_x2', 'alloc_x1', 'regime']].copy()
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            # Time in each regime
+            regime_counts = alloc_stats['regime'].value_counts()
+            total_days = len(alloc_stats)
+            
+            r0_pct = (regime_counts.get('R0', 0) / total_days) * 100
+            r1_pct = (regime_counts.get('R1', 0) / total_days) * 100
+            r2_pct = (regime_counts.get('R2', 0) / total_days) * 100
+            
+            col1.metric("Offensive (R0)", f"{r0_pct:.1f}%", f"{regime_counts.get('R0', 0)} days")
+            col2.metric("Prudence (R1)", f"{r1_pct:.1f}%", f"{regime_counts.get('R1', 0)} days")
+            col3.metric("Crisis (R2)", f"{r2_pct:.1f}%", f"{regime_counts.get('R2', 0)} days")
+            
+            # Average allocation
+            avg_safe = alloc_stats['alloc_x1'].mean()
+            col4.metric("Avg Safe Asset", f"{avg_safe:.1f}%")
+            
+            st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+            
+            # Allocation over time
+            st.markdown("#### Allocation Evolution")
+            
+            alloc_chart = df_res[['alloc_x2', 'alloc_x1']].copy()
+            alloc_chart.columns = ['Risk Asset (%)', 'Safe Asset (%)']
+            st.area_chart(alloc_chart, height=350)
+            
+            st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+            
+            # Regime transitions
+            st.markdown("#### Regime Transitions")
+            
+            if len(trades) > 0:
+                trades_df = pd.DataFrame(trades)
+                
+                # Count transitions
+                transition_counts = trades_df['label'].value_counts()
+                
+                trans_col1, trans_col2, trans_col3 = st.columns(3)
+                trans_col1.metric("→ OFFENSIVE", transition_counts.get('OFFENSIVE', 0))
+                trans_col2.metric("→ PRUDENCE", transition_counts.get('PRUDENCE', 0))
+                trans_col3.metric("→ CRASH", transition_counts.get('CRASH', 0))
+                
+                # Transition timeline
+                st.markdown("**Transition Timeline:**")
+                trades_display = trades_df[['date', 'from', 'to', 'label']].copy()
+                trades_display['date'] = trades_display['date'].dt.strftime('%Y-%m-%d')
+                trades_display.columns = ['Date', 'From', 'To', 'New Regime']
+                st.dataframe(trades_display, use_container_width=True, hide_index=True)
+            else:
+                st.info("ℹ️ No regime transitions occurred (stayed in R0 - Offensive)")
+            
+            st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+            
+            # Performance by regime
+            st.markdown("#### Performance by Regime")
+            
+            # Calculate returns by regime
+            df_res['returns'] = df_res['strategy'].pct_change()
+            
+            regime_performance = []
+            for regime in ['R0', 'R1', 'R2']:
+                regime_data = df_res[df_res['regime'] == regime]
+                if len(regime_data) > 0:
+                    regime_returns = regime_data['returns'].dropna()
+                    
+                    regime_performance.append({
+                        'Regime': f'{regime} ({["Offensive", "Prudence", "Crisis"][int(regime[1])]})',
+                        'Days': len(regime_data),
+                        'Avg Daily Return': f"{regime_returns.mean()*100:.3f}%",
+                        'Volatility': f"{regime_returns.std()*100:.2f}%",
+                        'Sharpe (Ann.)': f"{(regime_returns.mean() / regime_returns.std() * np.sqrt(252)):.2f}" if regime_returns.std() > 0 else "N/A",
+                        'Win Rate': f"{(regime_returns > 0).mean()*100:.1f}%"
+                    })
+            
+            if regime_performance:
+                perf_df = pd.DataFrame(regime_performance)
+                st.dataframe(perf_df, use_container_width=True, hide_index=True)
+            
+            st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+            
+            # Allocation efficiency analysis
+            st.markdown("#### 🔬 Allocation Efficiency")
+            
+            # Compare performance vs static allocations
+            static_results = []
+            
+            for safe_pct in [0, 25, 50, 75, 100]:
+                # Simulate static allocation
+                static_perf = df_res['bench_x2'] * (1 - safe_pct/100) + df_res['bench_x1'] * (safe_pct/100)
+                static_metrics = calculate_metrics_legacy(static_perf)
+                
+                static_results.append({
+                    'Allocation': f"{100-safe_pct}% Risk / {safe_pct}% Safe",
+                    'CAGR': f"{static_metrics['CAGR']:.2f}%",
+                    'Sharpe': f"{static_metrics['Sharpe']:.2f}",
+                    'Max DD': f"{static_metrics['MaxDD']:.2f}%"
+                })
+            
+            # Add dynamic strategy
+            static_results.append({
+                'Allocation': '🎯 Dynamic (This Strategy)',
+                'CAGR': f"{met_strat['CAGR']:.2f}%",
+                'Sharpe': f"{met_strat['Sharpe']:.2f}",
+                'Max DD': f"{met_strat['MaxDD']:.2f}%"
+            })
+            
+            comparison_df = pd.DataFrame(static_results)
+            st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+            
+            st.markdown("**Interpretation:**")
+            st.write("Dynamic allocation should outperform most static allocations by adapting to market conditions.")
+            
+            # Highlight best static
+            best_static_sharpe = max([float(r['Sharpe']) for r in static_results[:-1]])
+            if met_strat['Sharpe'] > best_static_sharpe:
+                st.success(f"✅ Dynamic strategy beats all static allocations (Sharpe: {met_strat['Sharpe']:.2f} vs {best_static_sharpe:.2f})")
+            else:
+                st.warning(f"⚠️ Some static allocations perform better. Consider adjusting parameters.")
+        
+        # TAB 5: OPTIMIZATION
         with tabs[3]:
             st.markdown("#### Bayesian Optimization Framework")
             st.info("Enterprise Bayesian optimization engine - 10x faster than grid search")
@@ -1025,8 +1298,8 @@ else:
             st.write("• Recovery: 20-70%")
             st.write("• Allocations: 30-100%")
         
-        # TAB 5: VALIDATION
-        with tabs[4]:
+        # TAB 6: VALIDATION
+        with tabs[5]:
             st.markdown("#### Walk-Forward Validation")
             st.info("Out-of-sample validation to prevent overfitting")
             

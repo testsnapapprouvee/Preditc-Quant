@@ -28,35 +28,62 @@ class DataEngine:
         
         for ticker in self.tickers:
             try:
-                df = yf.download(ticker, start=self.start, end=self.end, progress=False)
+                # Try with different parameters for better compatibility
+                df = yf.download(
+                    ticker, 
+                    start=self.start, 
+                    end=self.end, 
+                    progress=False,
+                    auto_adjust=False,  # Don't auto-adjust for splits
+                    actions=False  # Don't download actions
+                )
                 
-                if not df.empty:
-                    # Always use Adj Close for accurate returns
-                    if 'Adj Close' in df.columns:
-                        series = df['Adj Close']
-                    elif isinstance(df.columns, pd.MultiIndex):
-                        series = df[('Adj Close', ticker)]
-                    else:
-                        series = df['Close']
-                    
-                    # Store volume for quality checks
-                    volume = df['Volume'] if 'Volume' in df.columns else pd.Series(index=df.index)
-                    
-                    data_dict[ticker] = {
-                        'price': series,
-                        'volume': volume
-                    }
-                    
+                if df.empty:
+                    print(f"Warning: No data returned for {ticker}")
+                    continue
+                
+                # Handle MultiIndex columns (happens with single ticker sometimes)
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.droplevel(1)
+                
+                # Always use Adj Close for accurate returns
+                if 'Adj Close' in df.columns:
+                    series = df['Adj Close']
+                elif 'Close' in df.columns:
+                    series = df['Close']
+                else:
+                    print(f"Warning: No Close price for {ticker}")
+                    continue
+                
+                # Store volume for quality checks
+                volume = df['Volume'] if 'Volume' in df.columns else pd.Series(index=df.index)
+                
+                # Basic validation
+                if len(series) < 10:  # Need at least 10 days
+                    print(f"Warning: Insufficient data for {ticker} ({len(series)} days)")
+                    continue
+                
+                data_dict[ticker] = {
+                    'price': series,
+                    'volume': volume
+                }
+                
+                print(f"✓ Fetched {ticker}: {len(series)} days from {series.index[0]} to {series.index[-1]}")
+                
             except Exception as e:
                 print(f"Error fetching {ticker}: {str(e)}")
                 continue
         
         if not data_dict:
+            print("Error: No valid data fetched for any ticker")
             return pd.DataFrame()
         
         # Combine prices into single DataFrame
         prices = pd.DataFrame({ticker: data['price'] for ticker, data in data_dict.items()})
         volumes = pd.DataFrame({ticker: data['volume'] for ticker, data in data_dict.items()})
+        
+        # Align data (use intersection of dates)
+        prices = prices.dropna(how='all')
         
         self.universe = {'prices': prices, 'volumes': volumes}
         return prices

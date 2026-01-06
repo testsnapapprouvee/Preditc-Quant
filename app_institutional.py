@@ -881,13 +881,27 @@ tabs = st.tabs(["Performance", "Risk Analytics", "Allocation", "Trades"])
 
 # TAB 1: Performance
 with tabs[0]:
+    # Calcul des Deltas (Comparaison vs Benchmark X2 - Actif Risqué)
+    cagr_delta = met_strat['CAGR'] - met_x2['CAGR']
+    sharpe_delta = met_strat['Sharpe'] - met_x2['Sharpe']
+    sortino_delta = met_strat['Sortino'] - met_x2['Sortino']
+    # Pour le DD: Si Strat -10% et Bench -30% => -10 - (-30) = +20% (C'est une amélioration, donc vert)
+    dd_delta = met_strat['MaxDD'] - met_x2['MaxDD'] 
+    omega_delta = met_strat['Omega'] - met_x2['Omega']
+    
+    # Calcul durée moyenne de détention pour le contexte "Trades"
+    avg_hold_days = len(df_res) / len(trades) if len(trades) > 0 else 0
+
     k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric("CAGR", f"{met_strat['CAGR']:.2f}%")
-    k2.metric("Sharpe", f"{met_strat['Sharpe']:.3f}")
-    k3.metric("Sortino", f"{met_strat['Sortino']:.3f}")
-    k4.metric("Max DD", f"{met_strat['MaxDD']:.2f}%")
-    k5.metric("Omega", f"{met_strat['Omega']:.3f}")
-    k6.metric("Trades", len(trades))
+    
+    # Affichage avec les indicateurs de performance (vs Benchmark)
+    k1.metric("CAGR", f"{met_strat['CAGR']:.2f}%", f"{cagr_delta:+.2f}% vs Bmk")
+    k2.metric("Sharpe", f"{met_strat['Sharpe']:.3f}", f"{sharpe_delta:+.3f}")
+    k3.metric("Sortino", f"{met_strat['Sortino']:.3f}", f"{sortino_delta:+.3f}")
+    k4.metric("Max DD", f"{met_strat['MaxDD']:.2f}%", f"{dd_delta:+.2f}%")
+    k5.metric("Omega", f"{met_strat['Omega']:.3f}", f"{omega_delta:+.3f}")
+    # delta_color="off" pour afficher en gris (info neutre)
+    k6.metric("Trades", len(trades), f"~{avg_hold_days:.0f} days avg", delta_color="off")
     
     st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
     

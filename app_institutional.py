@@ -671,9 +671,20 @@ with st.sidebar:
     if 'params' not in st.session_state:
         st.session_state['params'] = {'thresh': 5.0, 'panic': 15, 'recovery': 30}
     
-    thresh = st.slider("Threshold Level (%)", 2.0, 10.0, float(st.session_state['params']['thresh']), 0.5)
-    panic = st.slider("Panic Threshold (%)", 10, 30, int(st.session_state['params']['panic']), 1)
-    recov = st.slider("Recovery Target (%)", 20, 60, int(st.session_state['params']['recovery']), 5)
+    # Show if using optimized parameters
+    if 'opt_score' in st.session_state:
+        st.info(f"✨ Using optimized parameters (Score: {st.session_state['opt_score']:.3f})")
+    
+    # Use session state values as defaults for sliders
+    thresh = st.slider("Threshold Level (%)", 2.0, 10.0, 
+                      float(st.session_state['params']['thresh']), 0.5,
+                      key='thresh_slider')
+    panic = st.slider("Panic Threshold (%)", 10, 30, 
+                     int(st.session_state['params']['panic']), 1,
+                     key='panic_slider')
+    recov = st.slider("Recovery Target (%)", 20, 60, 
+                     int(st.session_state['params']['recovery']), 5,
+                     key='recov_slider')
     
     st.markdown('<div class="section-header">Allocation Policy</div>', unsafe_allow_html=True)
     alloc_prud = st.slider("Prudent Mode (X1%)", 0, 100, 50, 10)
@@ -685,12 +696,104 @@ with st.sidebar:
     
     opt_col1, opt_col2 = st.columns(2)
     with opt_col1:
-        if st.button("BAYESIAN OPT"):
-            st.info("Feature implemented - see Advanced tab")
+        if st.button("⚡ OPTIMIZE", use_container_width=True):
+            # Get data first
+            opt_data = get_data_legacy(tickers, start_d, end_d)
+            
+            if not opt_data.empty:
+                with st.spinner(f"Running {profile} optimization..."):
+                    # Define search space based on profile
+                    if profile == "AGGRESSIVE":
+                        thresholds = [2, 3, 4, 5, 6]
+                        panics = [12, 15, 18, 20, 25]
+                        recoveries = [25, 30, 35, 40, 45]
+                    elif profile == "DEFENSIVE":
+                        thresholds = [4, 5, 6, 7, 8]
+                        panics = [15, 18, 20, 22, 25]
+                        recoveries = [30, 35, 40, 45, 50]
+                    else:  # BALANCED
+                        thresholds = [3, 4, 5, 6, 7]
+                        panics = [12, 15, 18, 20, 22]
+                        recoveries = [25, 30, 35, 40, 45]
+                    
+                    best_score = -np.inf
+                    best_params = None
+                    best_metrics = None
+                    tested = 0
+                    
+                    # Grid search
+                    for t in thresholds:
+                        for p in panics:
+                            if p <= t:
+                                continue
+                            for r in recoveries:
+                                test_params = {
+                                    'thresh': t,
+                                    'panic': p,
+                                    'recovery': r,
+                                    'allocPrudence': alloc_prud,
+                                    'allocCrash': alloc_crash,
+                                    'rollingWindow': 60,
+                                    'confirm': confirm,
+                                    'cost': 0.001
+                                }
+                                
+                                try:
+                                    res, trades = BacktestEngine.run_simulation(opt_data, test_params)
+                                    if res.empty:
+                                        continue
+                                    
+                                    metrics = calculate_metrics_legacy(res['strategy'])
+                                    
+                                    # Score based on profile
+                                    if profile == "DEFENSIVE":
+                                        score = metrics['Calmar']
+                                    elif profile == "BALANCED":
+                                        n_trades = len(trades)
+                                        turnover_penalty = max(0, (n_trades - 10) * 0.1)
+                                        score = metrics['Sharpe'] - turnover_penalty
+                                    else:  # AGGRESSIVE
+                                        score = metrics['CAGR'] if metrics['MaxDD'] > -35.0 else -1000
+                                    
+                                    if score > best_score:
+                                        best_score = score
+                                        best_params = {'thresh': t, 'panic': p, 'recovery': r}
+                                        best_metrics = metrics
+                                    
+                                    tested += 1
+                                except:
+                                    continue
+                    
+                    if best_params:
+                        # Update session state
+                        st.session_state['params'] = best_params
+                        st.session_state['opt_metrics'] = best_metrics
+                        st.session_state['opt_score'] = best_score
+                        
+                        # Show results
+                        st.success(f"✅ Optimization Complete!")
+                        st.write(f"**Best Parameters Found** (tested {tested} combinations):")
+                        st.write(f"• Threshold: **{best_params['thresh']}%**")
+                        st.write(f"• Panic: **{best_params['panic']}%**")
+                        st.write(f"• Recovery: **{best_params['recovery']}%**")
+                        st.write(f"\n**Expected Performance:**")
+                        st.write(f"• CAGR: **{best_metrics['CAGR']:.2f}%**")
+                        st.write(f"• Sharpe: **{best_metrics['Sharpe']:.2f}**")
+                        st.write(f"• Max DD: **{best_metrics['MaxDD']:.2f}%**")
+                        st.write(f"• Score: **{best_score:.3f}**")
+                        
+                        st.info("⚠️ **Refresh the page (F5)** to see strategy with optimized parameters")
+                    else:
+                        st.error("❌ Optimization failed - no valid parameters found")
+            else:
+                st.warning("⚠️ Load data first (select tickers and period)")
     
     with opt_col2:
-        if st.button("WALK-FORWARD"):
-            st.info("Feature implemented - see Validation tab")
+        if st.button("📊 RESET", use_container_width=True):
+            # Reset to defaults
+            st.session_state['params'] = {'thresh': 5.0, 'panic': 15, 'recovery': 30}
+            st.success("✅ Reset to default parameters")
+            st.info("⚠️ **Refresh the page (F5)** to apply reset")
 
 # ==========================================
 # MAIN CONTENT
@@ -773,6 +876,49 @@ else:
             k4.metric("Max DD", f"{met_strat['MaxDD']:.2f}%")
             k5.metric("Omega", f"{met_strat['Omega']:.3f}")
             k6.metric("Trades", len(trades))
+            
+            # Show optimization improvement if available
+            if 'opt_metrics' in st.session_state:
+                st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+                st.markdown("#### 🎯 Optimization Impact")
+                
+                opt_met = st.session_state['opt_metrics']
+                
+                col1, col2, col3, col4 = st.columns(4)
+                
+                cagr_delta = met_strat['CAGR'] - opt_met['CAGR']
+                sharpe_delta = met_strat['Sharpe'] - opt_met['Sharpe']
+                dd_delta = met_strat['MaxDD'] - opt_met['MaxDD']
+                
+                col1.metric("CAGR vs Optimized", f"{met_strat['CAGR']:.2f}%", 
+                           f"{cagr_delta:+.2f}%", 
+                           delta_color="normal" if cagr_delta >= 0 else "inverse")
+                
+                col2.metric("Sharpe vs Optimized", f"{met_strat['Sharpe']:.3f}", 
+                           f"{sharpe_delta:+.3f}",
+                           delta_color="normal" if sharpe_delta >= 0 else "inverse")
+                
+                col3.metric("Max DD vs Optimized", f"{met_strat['MaxDD']:.2f}%", 
+                           f"{dd_delta:+.2f}%",
+                           delta_color="inverse")
+                
+                # Overall improvement score
+                improvement = (
+                    (cagr_delta / abs(opt_met['CAGR']) if opt_met['CAGR'] != 0 else 0) * 0.4 +
+                    (sharpe_delta / abs(opt_met['Sharpe']) if opt_met['Sharpe'] != 0 else 0) * 0.4 +
+                    (-dd_delta / abs(opt_met['MaxDD']) if opt_met['MaxDD'] != 0 else 0) * 0.2
+                ) * 100
+                
+                col4.metric("Improvement Score", f"{improvement:+.1f}%",
+                           "Better" if improvement > 0 else "Worse",
+                           delta_color="normal" if improvement > 0 else "inverse")
+                
+                if improvement < -5:
+                    st.warning("⚠️ Current parameters underperform optimized. Click OPTIMIZE again or adjust sliders.")
+                elif improvement > 5:
+                    st.success("✅ Current parameters outperform optimization! Good manual tuning.")
+                else:
+                    st.info("ℹ️ Current performance close to optimized.")
             
             st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
             

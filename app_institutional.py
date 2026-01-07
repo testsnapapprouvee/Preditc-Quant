@@ -160,19 +160,26 @@ def get_data_legacy(tickers, start, end):
         df = yf.download(tickers[:2], start=start, end=end, progress=False, auto_adjust=True)
         
         # Handle MultiIndex columns (common in new yfinance)
+        # Structure might be (Price, Ticker) or just (Ticker) if Price is implicit
         if isinstance(df.columns, pd.MultiIndex):
+            # If 'Close' is in the first level
             if 'Close' in df.columns.get_level_values(0):
                 df = df['Close']
+            # If 'Adj Close' is in the first level
             elif 'Adj Close' in df.columns.get_level_values(0):
                 df = df['Adj Close']
         
         # Ensure we have the right columns
         if len(df.columns) >= 2:
+            # Reorder to match input tickers [Risk, Safe]
+            # yfinance sorts alphabetically, we need to respect input order
             available_cols = list(df.columns)
+            
+            # Map tickers to columns (handle potential formatting diffs)
             col_map = {}
             for t in tickers[:2]:
                 for c in available_cols:
-                    if t.upper() in c.upper(): 
+                    if t.upper() in c.upper(): # Loose matching
                         col_map[t] = c
                         break
             
@@ -187,12 +194,15 @@ def get_data_legacy(tickers, start, end):
     except Exception as e:
         print(f"Bulk download failed: {e}")
 
-    # Fallback: Individual download
+    # Fallback: Individual download (slower but safer)
     try:
         data_list = []
         for ticker in tickers[:2]:
             try:
+                # Force simple structure
                 df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+                
+                # Extract the price series
                 if 'Close' in df.columns:
                     data_list.append(df['Close'])
                 elif 'Adj Close' in df.columns:
@@ -200,6 +210,7 @@ def get_data_legacy(tickers, start, end):
                 elif isinstance(df, pd.Series):
                     data_list.append(df)
                 else:
+                    # Attempt to find any numeric column
                     numeric_cols = df.select_dtypes(include=[np.number]).columns
                     if len(numeric_cols) > 0:
                         data_list.append(df[numeric_cols[0]])
@@ -786,7 +797,7 @@ with st.sidebar:
             for v in valid_tickers:
                 st.write(v)
 
-    period_options = ["YTD", "1Y", "3YR", "5YR", "2022", "2008", "Custom"]
+    period_options = ["YTD", "1Y", "3YR", "5YR", "2022", "2008", "MAX", "Custom"]
     sel_period = st.selectbox("Analysis Period", period_options, index=4)
     
     today = datetime.now()
@@ -808,6 +819,9 @@ with st.sidebar:
     elif sel_period == "2008":
         start_d = datetime(2008, 1, 1)
         end_d = datetime(2008, 12, 31)
+    elif sel_period == "MAX":
+        start_d = datetime(2000, 1, 1)
+        end_d = today
     else:
         start_d = st.date_input("Start Date", datetime(2022, 1, 1))
         end_d = st.date_input("End Date", datetime(2022, 12, 31))
@@ -1104,100 +1118,4 @@ with tabs[2]:
         perf_df = pd.DataFrame(regime_performance)
         st.dataframe(perf_df, use_container_width=True, hide_index=True)
 
-    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-    
-    st.markdown("#### 🔬 Allocation Efficiency")
-    static_results = []
-    for safe_pct in [0, 25, 50, 75, 100]:
-        static_perf = df_res['bench_x2'] * (1 - safe_pct/100) + df_res['bench_x1'] * (safe_pct/100)
-        static_metrics = calculate_metrics_legacy(static_perf)
-        static_results.append({
-            'Allocation': f"{100-safe_pct}% Risk / {safe_pct}% Safe",
-            'CAGR': f"{static_metrics['CAGR']:.2f}%",
-            'Sharpe': f"{static_metrics['Sharpe']:.2f}",
-            'Max DD': f"{static_metrics['MaxDD']:.2f}%"
-        })
-        
-    static_results.append({
-        'Allocation': '🎯 Dynamic (This Strategy)',
-        'CAGR': f"{met_strat['CAGR']:.2f}%",
-        'Sharpe': f"{met_strat['Sharpe']:.2f}",
-        'Max DD': f"{met_strat['MaxDD']:.2f}%"
-    })
-    
-    comparison_df = pd.DataFrame(static_results)
-    st.dataframe(comparison_df, use_container_width=True, hide_index=True)
-    
-    best_static_sharpe = max([float(r['Sharpe']) for r in static_results[:-1]])
-    if met_strat['Sharpe'] > best_static_sharpe:
-        st.success(f"✅ Dynamic strategy beats all static allocations (Sharpe: {met_strat['Sharpe']:.2f} vs {best_static_sharpe:.2f})")
-    else:
-        st.warning(f"⚠️ Some static allocations perform better. Consider adjusting parameters.")
-
-# TAB 4: Trades
-with tabs[3]:
-    st.markdown("#### Trade History")
-    if len(trades) > 0:
-        trades_df = pd.DataFrame(trades)
-        
-        st.markdown("#### Transition Summary")
-        transition_counts = trades_df['label'].value_counts()
-        t1, t2, t3 = st.columns(3)
-        t1.metric("→ OFFENSIVE", transition_counts.get('OFFENSIVE', 0))
-        t2.metric("→ PRUDENCE", transition_counts.get('PRUDENCE', 0))
-        t3.metric("→ CRASH", transition_counts.get('CRASH', 0))
-        
-        st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-        st.markdown("**Transition Timeline:**")
-        
-        trades_display = trades_df[['date', 'from', 'to', 'label', 'portfolio']].copy()
-        trades_display['date'] = trades_display['date'].dt.strftime('%Y-%m-%d')
-        trades_display['portfolio'] = trades_display['portfolio'].apply(lambda x: f"{x:.2f}")
-        trades_display.columns = ['Date', 'From', 'To', 'New Regime', 'Portfolio Value']
-        
-        st.dataframe(trades_display, use_container_width=True, hide_index=True)
-    else:
-        st.info("ℹ️ No regime transitions occurred (stayed in R0 - Offensive)")
-
-# --- TAB 5: PM SHADOW (UPDATED) ---
-with tabs[4]:
-    st.markdown("#### 👥 PM Shadow Overlay")
-    st.info("Simulation d'un gestionnaire quantitatif (Shadow PM) comparé à la Stratégie A.")
-
-    # Note: Calculs déjà faits au début (Global)
-    # Visualisation uniquement ici
-    
-    # Metrics "Live" (Dernier jour connu)
-    last_score = pm_scores['pm_conviction'].iloc[-1]
-    last_alloc_risk = pm_allocs['alloc_risk'].iloc[-1] * 100
-    
-    col_pm1, col_pm2, col_pm3, col_pm4 = st.columns(4)
-    col_pm1.metric("PM Conviction", f"{last_score:.2f}")
-    col_pm2.metric("PM Exposure (Risk)", f"{last_alloc_risk:.0f}%")
-    col_pm3.metric("PM Shadow CAGR", f"{met_pm['CAGR']:.2f}%")
-    
-    delta_perf = met_pm['Cumul'] - met_strat['Cumul']
-    col_pm4.metric("Delta vs Strategy A", f"{delta_perf:+.2f}%", help="Différence de rendement cumulé")
-
-    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-    
-    # GRAPHIQUE 1 : PERFORMANCE COMPARÉE
-    st.markdown("#### 📈 Overlay de Performance (Base 100)")
-    # On normalise tout à 100
-    overlay_chart = pd.DataFrame({
-        'Strategy A': (df_res['strategy'] / df_res['strategy'].iloc[0]) * 100,
-        'PM Shadow': (df_res['pm_shadow'] / df_res['pm_shadow'].iloc[0]) * 100
-    })
-    st.line_chart(overlay_chart, height=350)
-    
-    # GRAPHIQUE 2 : ALLOCATION DYNAMIQUE PM
-    st.markdown("#### 🧠 Conviction & Allocation du Shadow PM")
-    st.area_chart(pm_allocs['alloc_risk'] * 100, height=200, color="#3B82F6")
-    st.caption("Zone Bleue = % d'exposition à l'actif risqué (LQQ/Risk) décidé par le Shadow PM.")
-
-st.markdown("---")
-st.markdown("""
-<div style="text-align: center; color: #606060; font-size: 10px; padding: 16px 0; text-transform: uppercase; letter-spacing: 0.1em;">
-    PREDICT. INSTITUTIONAL ANALYTICS v6.0 • ENTERPRISE EDITION
-</div>
-""", unsafe_allow_html=True)
+    st.markdown('<div class="section-divider">

@@ -1016,7 +1016,7 @@ with tabs[0]:
     k5.metric("Omega", f"{met_strat['Omega']:.3f}", f"{omega_delta:+.3f}")
     k6.metric("Trades", len(trades), f"~{avg_hold_days:.0f} days avg", delta_color="off")
     
-    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+    st.markdown("""<div class="section-divider"></div>""", unsafe_allow_html=True)
     
     # --- CHART WITH PM SHADOW (UPDATED) ---
     st.markdown("#### Cumulative Performance")
@@ -1058,7 +1058,7 @@ with tabs[1]:
     r3.metric("Skewness", f"{met_strat['Skew']:.3f}")
     r4.metric("Kurtosis", f"{met_strat['Kurt']:.3f}")
     
-    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+    st.markdown("""<div class="section-divider"></div>""", unsafe_allow_html=True)
     
     st.markdown("#### Drawdown Analysis")
     dd_strat = (df_res['strategy'] / df_res['strategy'].cummax() - 1) * 100
@@ -1088,14 +1088,14 @@ with tabs[2]:
     avg_safe = alloc_stats['alloc_x1'].mean()
     col4.metric("Avg Safe Asset", f"{avg_safe:.1f}%")
     
-    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+    st.markdown("""<div class="section-divider"></div>""", unsafe_allow_html=True)
     
     st.markdown("#### Allocation Evolution")
     alloc_chart = df_res[['alloc_x2', 'alloc_x1']].copy()
     alloc_chart.columns = ['Risk Asset (%)', 'Safe Asset (%)']
     st.area_chart(alloc_chart, height=350)
     
-    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+    st.markdown("""<div class="section-divider"></div>""", unsafe_allow_html=True)
     
     st.markdown("#### Performance by Regime")
     df_res['returns'] = df_res['strategy'].pct_change()
@@ -1118,4 +1118,171 @@ with tabs[2]:
         perf_df = pd.DataFrame(regime_performance)
         st.dataframe(perf_df, use_container_width=True, hide_index=True)
 
-    st.markdown('<div class="section-divider">
+    st.markdown("""<div class="section-divider"></div>""", unsafe_allow_html=True)
+    
+    st.markdown("#### 🔬 Allocation Efficiency")
+    static_results = []
+    for safe_pct in [0, 25, 50, 75, 100]:
+        static_perf = df_res['bench_x2'] * (1 - safe_pct/100) + df_res['bench_x1'] * (safe_pct/100)
+        static_metrics = calculate_metrics_legacy(static_perf)
+        static_results.append({
+            'Allocation': f"{100-safe_pct}% Risk / {safe_pct}% Safe",
+            'CAGR': f"{static_metrics['CAGR']:.2f}%",
+            'Sharpe': f"{static_metrics['Sharpe']:.2f}",
+            'Max DD': f"{static_metrics['MaxDD']:.2f}%"
+        })
+        
+    static_results.append({
+        'Allocation': '🎯 Dynamic (This Strategy)',
+        'CAGR': f"{met_strat['CAGR']:.2f}%",
+        'Sharpe': f"{met_strat['Sharpe']:.2f}",
+        'Max DD': f"{met_strat['MaxDD']:.2f}%"
+    })
+    
+    comparison_df = pd.DataFrame(static_results)
+    st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+    
+    best_static_sharpe = max([float(r['Sharpe']) for r in static_results[:-1]])
+    if met_strat['Sharpe'] > best_static_sharpe:
+        st.success(f"✅ Dynamic strategy beats all static allocations (Sharpe: {met_strat['Sharpe']:.2f} vs {best_static_sharpe:.2f})")
+    else:
+        st.warning(f"⚠️ Some static allocations perform better. Consider adjusting parameters.")
+
+# TAB 4: Trades
+with tabs[3]:
+    st.markdown("#### Trade History")
+    if len(trades) > 0:
+        trades_df = pd.DataFrame(trades)
+        
+        st.markdown("#### Transition Summary")
+        transition_counts = trades_df['label'].value_counts()
+        t1, t2, t3 = st.columns(3)
+        t1.metric("→ OFFENSIVE", transition_counts.get('OFFENSIVE', 0))
+        t2.metric("→ PRUDENCE", transition_counts.get('PRUDENCE', 0))
+        t3.metric("→ CRASH", transition_counts.get('CRASH', 0))
+        
+        st.markdown("""<div class="section-divider"></div>""", unsafe_allow_html=True)
+        st.markdown("**Transition Timeline:**")
+        
+        trades_display = trades_df[['date', 'from', 'to', 'label', 'portfolio']].copy()
+        trades_display['date'] = trades_display['date'].dt.strftime('%Y-%m-%d')
+        trades_display['portfolio'] = trades_display['portfolio'].apply(lambda x: f"{x:.2f}")
+        trades_display.columns = ['Date', 'From', 'To', 'New Regime', 'Portfolio Value']
+        
+        st.dataframe(trades_display, use_container_width=True, hide_index=True)
+    else:
+        st.info("ℹ️ No regime transitions occurred (stayed in R0 - Offensive)")
+
+# --- TAB 5: PM SHADOW (FINAL STEP: METRICS & COMPARISON) ---
+with tabs[4]:
+    st.markdown("#### 👥 PM Shadow Overlay: Head-to-Head")
+    st.info("Comparaison directe entre votre Stratégie A (Règles fixes) et le PM Shadow (Modèle Quantitatif 'Smooth').")
+
+    if not data.empty and 'pm_shadow' in df_res.columns:
+        
+        # --- 1. KPI LIVE (Dernier jour) ---
+        last_score = pm_scores['pm_conviction'].iloc[-1]
+        last_alloc = pm_allocs['alloc_risk'].iloc[-1] * 100
+        
+        col_kpi1, col_kpi2, col_kpi3, col_kpi4 = st.columns(4)
+        col_kpi1.metric("PM Conviction (Actuelle)", f"{last_score:.2f}")
+        col_kpi2.metric("PM Exposition Risque", f"{last_alloc:.0f}%")
+        
+        # Calcul des écarts de performance totale
+        total_ret_strat = (df_res['strategy'].iloc[-1] / df_res['strategy'].iloc[0]) - 1
+        total_ret_pm = (df_res['pm_shadow'].iloc[-1] / df_res['pm_shadow'].iloc[0]) - 1
+        delta_ret = (total_ret_pm - total_ret_strat) * 100
+        
+        col_kpi3.metric("Performance PM (Cumul)", f"{total_ret_pm*100:.1f}%")
+        col_kpi4.metric("Alpha PM vs Strat A", f"{delta_ret:+.1f}%", 
+                        delta_color="normal" if delta_ret > 0 else "inverse")
+
+        st.markdown("""<div class="section-divider"></div>""", unsafe_allow_html=True)
+
+        # --- 2. TABLEAU COMPARATIF DÉTAILLÉ (STEP 5 & 6) ---
+        st.markdown("#### 📊 Analyse Comparative Détaillée")
+        
+        # Construction du tableau de données
+        comp_data = {
+            'Métrique': ['CAGR (Annuel)', 'Volatilité', 'Sharpe Ratio', 'Max Drawdown', 'Sortino', 'Calmar', 'Skewness'],
+            'Strategy A': [
+                f"{met_strat['CAGR']:.2f}%", f"{met_strat['Vol']:.2f}%", f"{met_strat['Sharpe']:.2f}",
+                f"{met_strat['MaxDD']:.2f}%", f"{met_strat['Sortino']:.2f}", f"{met_strat['Calmar']:.2f}", f"{met_strat['Skew']:.2f}"
+            ],
+            'PM Shadow (Quant)': [
+                f"{met_pm['CAGR']:.2f}%", f"{met_pm['Vol']:.2f}%", f"{met_pm['Sharpe']:.2f}",
+                f"{met_pm['MaxDD']:.2f}%", f"{met_pm['Sortino']:.2f}", f"{met_pm['Calmar']:.2f}", f"{met_pm['Skew']:.2f}"
+            ],
+            'Delta (PM - Strat)': [
+                f"{(met_pm['CAGR'] - met_strat['CAGR']):+.2f}%",
+                f"{(met_pm['Vol'] - met_strat['Vol']):+.2f}%",
+                f"{(met_pm['Sharpe'] - met_strat['Sharpe']):+.2f}",
+                f"{(met_pm['MaxDD'] - met_strat['MaxDD']):+.2f}%",
+                f"{(met_pm['Sortino'] - met_strat['Sortino']):+.2f}",
+                f"{(met_pm['Calmar'] - met_strat['Calmar']):+.2f}",
+                f"{(met_pm['Skew'] - met_strat['Skew']):+.2f}"
+            ]
+        }
+        st.dataframe(pd.DataFrame(comp_data), use_container_width=True, hide_index=True)
+        
+        st.caption("""
+        **Interprétation :**
+        - **Delta Positif sur CAGR/Sharpe** : Le PM Shadow génère plus de rendement ou de qualité ajustée au risque.
+        - **Delta Positif sur MaxDD** : Le PM Shadow protège MOINS bien (Drawdown plus profond, ex: -20% vs -15% donne un delta de -5%).
+        """)
+
+        st.markdown("""<div class="section-divider"></div>""", unsafe_allow_html=True)
+
+        # --- 3. GRAPHIQUES AVANCÉS ---
+        
+        col_g1, col_g2 = st.columns(2)
+        
+        with col_g1:
+            st.markdown("#### 📉 Drawdown Comparison")
+            # Calcul des drawdowns pour affichage overlay
+            dd_strat = (df_res['strategy'] / df_res['strategy'].cummax() - 1) * 100
+            dd_pm = (df_res['pm_shadow'] / df_res['pm_shadow'].cummax() - 1) * 100
+            
+            dd_df = pd.DataFrame({'Strategy A': dd_strat, 'PM Shadow': dd_pm})
+            st.line_chart(dd_df, height=300)
+            st.caption("Qui creuse le moins profond lors des crises ?")
+
+        with col_g2:
+            st.markdown("#### 🧠 Allocations Comparées")
+            # Comparaison visuelle des choix d'allocation
+            # Strat A (Regime) vs PM (Score)
+            alloc_df = pd.DataFrame({
+                'Strat A (Risk %)': df_res['alloc_x2'],
+                'PM Shadow (Risk %)': pm_allocs['alloc_risk'] * 100
+            })
+            # On ne prend que les 200 derniers jours pour lisibilité si l'historique est long
+            if len(alloc_df) > 500:
+                st.line_chart(alloc_df.tail(300), height=300)
+                st.caption("Zoom sur les 300 derniers jours : La Strat A fait des 'sauts' (R0/R1), le PM est plus fluide.")
+            else:
+                st.line_chart(alloc_df, height=300)
+
+        # --- 4. AUDIT LAYER (Conclusion) ---
+        st.markdown("#### 📝 Audit Automatique")
+        
+        better_sharpe = met_pm['Sharpe'] > met_strat['Sharpe']
+        better_dd = met_pm['MaxDD'] > met_strat['MaxDD'] # Rappel: MaxDD est négatif, donc -10 > -20
+        
+        if better_sharpe and better_dd:
+            st.success("✅ **VERDICT : PM Shadow Supérieur.** Le modèle quantitatif offre un meilleur rendement ajusté au risque ET une meilleure protection.")
+        elif better_sharpe and not better_dd:
+            st.warning("⚠️ **VERDICT : PM Shadow plus Agressif.** Il génère plus de performance globale mais accepte des drawdowns plus profonds.")
+        elif not better_sharpe and better_dd:
+            st.info("🛡️ **VERDICT : PM Shadow plus Défensif.** Il protège mieux le capital mais sous-performe en rendement pur.")
+        else:
+            st.error("❌ **VERDICT : Strategy A Supérieure.** Vos règles fixes (thresh/panic) battent le modèle quantitatif sur tous les points.")
+
+    else:
+        st.warning("Données insuffisantes pour l'analyse comparative.")
+
+st.markdown("---")
+st.markdown("""
+<div style="text-align: center; color: #606060; font-size: 10px; padding: 16px 0; text-transform: uppercase; letter-spacing: 0.1em;">
+    PREDICT. INSTITUTIONAL ANALYTICS v6.0 • ENTERPRISE EDITION
+</div>
+""", unsafe_allow_html=True)
